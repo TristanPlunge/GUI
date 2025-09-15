@@ -6,12 +6,21 @@ from ssh_db_connector import SSHDatabaseConnector
 
 LA_TZ = pytz.timezone("America/Los_Angeles")
 
+
 class QueryManager:
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, units="f"):
+        """
+        :param logger: optional logging function
+        :param units: "c" or "f" for temperature output
+        """
         self.connector = None
         self.engine = None
         self.logger = logger or (lambda msg: print(msg))
+        self.units = units.lower()
 
+    # -------------------------------
+    # Connection handling
+    # -------------------------------
     def connect(self):
         """Ensure a database connection is established."""
         if not self.engine:
@@ -20,16 +29,16 @@ class QueryManager:
             self.engine = self.connector.connect_over_ssh()
             self.logger("Database connection established.")
 
+    # -------------------------------
+    # Main query
+    # -------------------------------
     def run_query(self, filter_type, filter_value, start_date_str, end_date_str, selected_columns):
-        """Run query and return DataFrame with clean LA-time updated_at datetimes."""
+        """Run query and return DataFrame with normalized units and clean column labels."""
         self.connect()
 
         # Parse user inputs and expand to full days
         start_date = datetime.fromisoformat(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = datetime.fromisoformat(end_date_str).replace(hour=23, minute=59, second=59)
-
-        cols = ["updated_at"] + selected_columns
-        cols_str = ", ".join(cols)
 
         query = text(f"""
             SELECT *
@@ -62,14 +71,33 @@ class QueryManager:
         # ✅ Convert to tz-naive Los Angeles time for Matplotlib
         df["updated_at"] = df["updated_at"].dt.tz_convert(LA_TZ).dt.tz_localize(None)
 
-        # --- Debug prints ---
+        # -------------------------------
+        # Unit Normalization
+        # -------------------------------
+        # Fan tach scaling
+        if "fan_tach_rpm" in df.columns:
+            df["fan_tach_rpm (RPM/100)"] = df["fan_tach_rpm"] / 100.0
+            df.drop(columns=["fan_tach_rpm"], inplace=True)
+
+        # Temperature conversions
+        temp_cols = [c for c in df.columns if c.endswith("_temp_c")]
+        for col in temp_cols:
+            if self.units == "f":
+                new_col = col.replace("_temp_c", "_temp_f")
+                df[new_col] = df[col] * 9.0 / 5.0 + 32.0
+                df.drop(columns=[col], inplace=True)
+
+        # ✅ Final debug logging
         self.logger(f"updated_at dtype: {df['updated_at'].dtype}")
         if not df.empty:
             self.logger(f"updated_at sample: {df['updated_at'].head(3).to_list()}")
-            self.logger(f"Non-null counts:\n{df.notna().sum()}")
+            self.logger(f"Columns after normalization: {list(df.columns)}")
 
         return df
 
+    # -------------------------------
+    # Close connections
+    # -------------------------------
     def close(self):
         """Close database connections cleanly."""
         if self.connector:

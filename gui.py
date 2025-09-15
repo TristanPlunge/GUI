@@ -31,35 +31,36 @@ class MetricsApp:
         # Master color map
         self.color_map = {
             "fan_tach_rpm": "#1E90FF",
-            "coolant_temp_c": "#FF4500",
-            "ebox_temp_c": "#FFD700",
-            "water_temp_c": "#00CED1",
-            "target_temp_c": "#ADFF2F",
+            "coolant_temp_f": "#FF4500",
+            "ebox_temp_f": "#FFD700",
+            "water_temp_f": "#00CED1",
+            "target_temp_f": "#ADFF2F",
             "flow_sense_lpm": "#00FF7F",
             "pump_current_amp": "#FF69B4",
-            "compressor_current_amp": "#FF00FF",
-            "custom_orange": "#FFA500",
+            "compressor_current_amp": "#FFA500",
         }
 
         # Root window
         self.root = ctk.CTk()
         self.root.withdraw()
-        self.root.title("📊 Metrics Dashboard (CTk + SSH)")
+        self.root.title("Plunge Tub Metrics Analytics")
 
         # ✅ Load config
         self.config = config_manager.load_config()
 
         # Build UI
-        self.build_controls()
         self.build_output()
+        self.build_controls()
         self.build_log()
 
         # Try to restore cached plot
         self.restore_cached_plot()
 
         # Grid weights
-        self.root.grid_rowconfigure(1, weight=1)
-        self.root.grid_rowconfigure(2, weight=0)
+        # Root grid config
+        self.root.grid_rowconfigure(0, weight=0)  # controls fixed
+        self.root.grid_rowconfigure(1, weight=1)  # output flex
+        self.root.grid_rowconfigure(2, weight=0)  # log collapsible
         self.root.grid_columnconfigure(0, weight=1)
 
         # Restore window size/state
@@ -136,20 +137,22 @@ class MetricsApp:
     # UI building
     # -------------------------------
     def build_controls(self):
-        self.control_frame = ctk.CTkFrame(self.root, corner_radius=12)
-        self.control_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        # --- Filter, Date & Columns collapsible ---
+        self.control_frame = ctk.CTkFrame(self.output_frame, corner_radius=12)
+        self.control_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
 
-        # --- One combined Filter + Columns ---
-        self.filter_date_section = CollapsibleSection(self.control_frame, title="Filter, Date & Columns")
+        self.filter_date_section = CollapsibleSection(
+            self.control_frame, title="Filter, Date & Columns"
+        )
         self.filter_date_section.pack(fill="x", padx=10, pady=5)
 
-        # Row frame for filter + date inputs
+        # Row container for filter/date/columns
         row_frame = ctk.CTkFrame(self.filter_date_section.content, fg_color="transparent")
         row_frame.pack(fill="x", padx=5, pady=5)
 
-        # Filter box
+        # ---------------- Filter box ----------------
         filter_box = ctk.CTkFrame(row_frame, corner_radius=8)
-        filter_box.pack(side="left", padx=5, pady=5, anchor="w")
+        filter_box.pack(side="left", padx=5, pady=5, anchor="n")
 
         ctk.CTkLabel(filter_box, text="Filter Type:").pack(anchor="w", padx=5, pady=2)
         self.filter_type = ctk.StringVar(value=self.config.get("filter_type", "device_name"))
@@ -164,48 +167,86 @@ class MetricsApp:
         self.filter_value.insert(0, self.config.get("filter_value", ""))
         self.filter_value.pack(anchor="w", padx=5, pady=2)
 
-        # Date box
+        # ---------------- Date box ----------------
         date_box = ctk.CTkFrame(row_frame, corner_radius=8)
-        date_box.pack(side="left", padx=5, pady=5, anchor="w")
+        date_box.pack(side="left", padx=5, pady=5, anchor="n")
 
         ctk.CTkLabel(date_box, text="Start Date:").pack(anchor="w", padx=5, pady=2)
         self.start_date_entry = ctk.CTkEntry(date_box, width=180)
-        self.start_date_entry.insert(0, self.config.get("start_date",
-                                                        (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")))
+        self.start_date_entry.insert(0, self.config.get(
+            "start_date", (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        ))
         self.start_date_entry.pack(anchor="w", padx=5, pady=2)
 
         ctk.CTkLabel(date_box, text="End Date:").pack(anchor="w", padx=5, pady=2)
         self.end_date_entry = ctk.CTkEntry(date_box, width=180)
-        self.end_date_entry.insert(0, self.config.get("end_date", datetime.now().strftime("%Y-%m-%d")))
+        self.end_date_entry.insert(0, self.config.get(
+            "end_date", datetime.now().strftime("%Y-%m-%d")
+        ))
         self.end_date_entry.pack(anchor="w", padx=5, pady=2)
 
-        # --- Columns (moved inside same collapsible) ---
-        col_frame = ctk.CTkFrame(self.filter_date_section.content, corner_radius=8)
-        col_frame.pack(fill="x", padx=5, pady=5)
+        # ---------------- Columns box ----------------
+        col_frame = ctk.CTkFrame(row_frame, corner_radius=8)
+        col_frame.pack(side="left", fill="x", expand=True, padx=5, pady=5, anchor="n")
 
+        # Available columns come from color_map at startup
         self.available_columns = list(self.color_map.keys())
         self.col_vars = {}
-        selected_cols = self.config.get("columns", ["fan_tach_rpm", "coolant_temp_c", "ebox_temp_c"])
+        selected_cols = self.config.get("columns", ["fan_tach_rpm", "coolant_temp_f", "ebox_temp_f"])
+
+        rows = 4  # number of rows for checkbox layout
         for i, col in enumerate(self.available_columns):
             var = ctk.BooleanVar(value=col in selected_cols)
-            wrapper = ctk.CTkFrame(col_frame, corner_radius=8)
-            wrapper.grid(row=i // 3, column=i % 3, padx=10, pady=5, sticky="w")
-
             chk = ctk.CTkCheckBox(
-                wrapper,
+                col_frame,
                 text=col,
                 variable=var,
                 command=self.on_column_change,
                 fg_color=self.color_map[col],
                 text_color=self.color_map[col]
             )
-            chk.pack(anchor="w", padx=5, pady=5)
-
+            chk.grid(
+                row=i % rows,
+                column=i // rows,
+                padx=5, pady=5, sticky="w"
+            )
             self.col_vars[col] = var
 
-        # --- Run Query ---
-        self.run_frame = ctk.CTkFrame(self.control_frame, fg_color="transparent")
-        self.run_frame.pack(fill="x", pady=10)
+    def build_output(self):
+        self.output_frame = ctk.CTkFrame(self.root, corner_radius=12)
+        self.output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+
+        # Configure grid: 4 rows, 1 col
+        self.output_frame.grid_rowconfigure(0, weight=1)  # plot flexes
+        self.output_frame.grid_rowconfigure(1, weight=0)  # table collapsible
+        self.output_frame.grid_rowconfigure(2, weight=0)  # filter/date/columns
+        self.output_frame.grid_rowconfigure(3, weight=0)  # run query controls
+        self.output_frame.grid_columnconfigure(0, weight=1)
+
+        # ---------------- Plot ----------------
+        self.plot_frame = ctk.CTkFrame(self.output_frame, corner_radius=12)
+        self.plot_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+        self.plot_manager = PlotManager(
+            self.plot_frame,
+            on_select=self.on_select,
+            on_key=self.on_key
+        )
+
+        # ---------------- Data Table ----------------
+        self.table_section = CollapsibleSection(self.output_frame, title="Data Table")
+        self.table_section.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        self.table_frame = ctk.CTkFrame(self.table_section.content, corner_radius=12)
+        self.table_frame.pack(fill="both", expand=True)
+
+        # ---------------- Filter/Date/Columns ----------------
+        # built in build_controls()
+        # placed in row=2 by that function
+
+        # ---------------- Run Query Controls ----------------
+        self.run_frame = ctk.CTkFrame(self.output_frame, fg_color="transparent")
+        self.run_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=10)
 
         self.run_btn = ctk.CTkButton(
             self.run_frame, text="▶ Run Query",
@@ -221,78 +262,42 @@ class MetricsApp:
         )
         self.status_label.pack(side="left", padx=10)
 
-    def build_output(self):
-        self.output_frame = ctk.CTkFrame(self.root, corner_radius=12)
-        self.output_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-
-        # Plot
-        self.plot_frame = ctk.CTkFrame(self.output_frame, corner_radius=12)
-        self.plot_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        self.plot_manager = PlotManager(
-            self.plot_frame,
-            on_select=self.on_select,
-            on_key=self.on_key
-        )
-
-        # Table
-        self.table_section = CollapsibleSection(self.output_frame, title="Data Table")
-        self.table_section.pack(fill="both", expand=True, padx=5, pady=5)
-
-        self.table_frame = ctk.CTkFrame(self.table_section.content, corner_radius=12)
-        self.table_frame.pack(fill="both", expand=True)
-
     def build_log(self):
+        # Log collapsible goes in root row=2
         self.log_section = CollapsibleSection(self.root, title="Process Log")
-        self.log_section.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        self.log_section.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+
+        self.log_section.content.grid_rowconfigure(0, weight=1)
+        self.log_section.content.grid_columnconfigure(0, weight=1)
+
         self.log_text = ctk.CTkTextbox(self.log_section.content, height=100)
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
     # -------------------------------
     # Table handling
     # -------------------------------
     def show_table(self, df):
-        for widget in self.table_frame.winfo_children():
-            widget.destroy()
-
         if df is None or df.empty:
+            for widget in self.table_frame.winfo_children():
+                widget.destroy()
             ctk.CTkLabel(self.table_frame, text="No data available").pack()
             return
 
-        self.table_df = df.copy()
-
-        sheet = Sheet(
-            self.table_frame,
-            data=self.table_df.values.tolist(),
-            headers=list(self.table_df.columns),
-        )
-
-        # Read-only
-        sheet.enable_bindings((
-            "single_select", "row_select", "column_select", "drag_select",
-            "arrowkeys", "copy", "select_all"
-        ))
-
-        if not hasattr(self, "sort_states"):
-            self.sort_states = {}
-
-        def sort_column(event):
-            col_index = event["column"]
-            col_name = self.table_df.columns[col_index]
-
-            descending = not self.sort_states.get(col_index, False)
-            self.sort_states[col_index] = descending
-
-            sorted_df = self.table_df.sort_values(
-                by=col_name, ascending=not descending, na_position="last"
-            ).reset_index(drop=True)
-
-            self.table_df = sorted_df
-            sheet.set_sheet_data(sorted_df.values.tolist())
-
-        sheet.extra_bindings([("column_select_double", sort_column)])
-
-        sheet.pack(fill="both", expand=True)
+        if not hasattr(self, "sheet"):
+            self.sheet = Sheet(
+                self.table_frame,
+                data=df.values.tolist(),
+                headers=list(df.columns),
+                height=200,
+            )
+            self.sheet.enable_bindings((
+                "single_select", "row_select", "column_select", "drag_select",
+                "arrowkeys", "copy", "select_all"
+            ))
+            self.sheet.pack(fill="both", expand=True)
+        else:
+            self.sheet.set_sheet_data(df.values.tolist())
+            self.sheet.headers(df.columns.tolist())
 
     # -------------------------------
     # Cache + log + timer helpers (unchanged from before)
