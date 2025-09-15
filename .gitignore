@@ -1,0 +1,14 @@
+.idea/
+__pycache__/
+old/
+
+*.txt
+*.json
+*.parquet
+*.pkl
+
+test.py
+main2.py
+annotator.py
+timegaps.py
+.env
