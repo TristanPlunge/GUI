@@ -89,7 +89,8 @@ class PlotManager:
 
         if fresh:
             for widget in self.output_frame.winfo_children():
-                widget.destroy()
+                if widget is self.canvas.get_tk_widget():
+                    widget.destroy()
             self.init_plot()
             preserve_limits = False
             vline_x = None  # nothing to restore yet
@@ -369,11 +370,12 @@ class PlotManager:
     # -------------------------------
     # Cache
     # -------------------------------
-    def _save_cache(self, df, selected_columns):
+    def _save_cache(self, df, selected_columns, col_states=None):
         try:
             df.to_parquet(self.cache_file)
             meta = {
                 "columns": selected_columns,
+                "col_states": col_states or {},  # ✅ save checkbox states
                 "xlim": list(self.ax.get_xlim()),
                 "ylim": list(self.ax.get_ylim())
             }
@@ -389,13 +391,19 @@ class PlotManager:
                 with open(self.meta_file, "r") as f:
                     meta = json.load(f)
                 columns = meta.get("columns", [])
+                col_states = meta.get("col_states", {})  # load states
+                xlim = meta.get("xlim")
+                ylim = meta.get("ylim")
+
                 self.plot_data(df, columns, fresh=True)
-                if "xlim" in meta:
-                    self.ax.set_xlim(meta["xlim"])
-                if "ylim" in meta:
-                    self.ax.set_ylim(meta["ylim"])
+                if xlim:
+                    self.ax.set_xlim(xlim)
+                if ylim:
+                    self.ax.set_ylim(ylim)
                 self.canvas.draw_idle()
-                return df, columns
+
+                return df, columns, col_states
             except Exception as e:
                 print(f"[Cache] Failed to load: {e}")
-        return None, None
+        return None, [], {}
+
