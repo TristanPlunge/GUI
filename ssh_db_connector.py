@@ -159,7 +159,7 @@ class SSHDatabaseConnector:
 
         # --- SQLAlchemy engine ---
         db_url = (
-            f"mysql+pymysql://{self.params['MYSQL_USER']}:{self.params['MYSQL_PASSWORD']}"
+            f"mysql+mysqldb://{self.params['MYSQL_USER']}:{self.params['MYSQL_PASSWORD']}"
             f"@127.0.0.1:{self.local_port}/{self.params['MYSQL_DB']}"
         )
         self.engine = create_engine(db_url)

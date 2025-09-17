@@ -3,7 +3,7 @@ import pytz
 from sqlalchemy import text
 from datetime import datetime
 from ssh_db_connector import SSHDatabaseConnector
-
+import time
 LA_TZ = pytz.timezone("America/Los_Angeles")
 
 
@@ -55,6 +55,7 @@ class QueryManager:
             "end_date": end_la.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+
         query = text(f"""
             SELECT *
             FROM cp_device_metrics
@@ -63,15 +64,27 @@ class QueryManager:
             LIMIT 30000;
         """)
 
+        t0 = time.time()
+        with self.engine.connect().execution_options(stream_results=True) as conn:
+            t1 = time.time()
+            result = conn.execute(query, params)
+            self.logger(f"[TIMING] Query executed in {time.time() - t1:.2f} sec")
 
-        df = pd.read_sql(query, self.engine, params=params)
+            t2 = time.time()
+            rows = result.fetchall()
+            self.logger(f"[TIMING] Rows fetched in {time.time() - t2:.2f} sec")
 
-        # --- Make column name checks safe BEFORE any access ---
+            t3 = time.time()
+            df = pd.DataFrame(rows, columns=result.keys())
+            self.logger(f"[TIMING] DataFrame built in {time.time() - t3:.2f} sec")
+
+        self.logger(f"[TIMING] Total run_query time: {time.time() - t0:.2f} sec")
+
+        # --- Now safe to process df as before ---
         if df.empty:
             self.logger("⚠️ No metrics: query returned 0 rows.")
             return df
 
-        # normalize column names to lower for easier matching
         df.columns = [c.lower() for c in df.columns]
 
         # try a few common aliases if 'updated_at' is missing
@@ -91,9 +104,8 @@ class QueryManager:
 
         if "updated_at" not in df.columns:
             self.logger(f"⚠️ No metrics: 'updated_at' column not found. Columns: {list(df.columns)}")
-            return pd.DataFrame()  # -> UI will show "No data available"
+            return pd.DataFrame()
 
-        # --- From here it's safe to touch the column ---
         df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True)
         df = df.dropna(subset=["updated_at"])
         if df.empty:
@@ -118,7 +130,7 @@ class QueryManager:
             if temp_cols:
                 df.drop(columns=temp_cols, inplace=True)
 
-        # Safe logging (guarded)
+        # Safe logging
         self.logger(f"updated_at dtype: {df['updated_at'].dtype}")
         if not df.empty:
             self.logger(f"updated_at sample: {df['updated_at'].head(3).to_list()}")
