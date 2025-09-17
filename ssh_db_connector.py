@@ -2,11 +2,11 @@ import paramiko
 import socket as s
 import threading, select
 import keyring
-from sqlalchemy import create_engine, text, event
-from pathlib import Path
+from sqlalchemy import create_engine
 from env_editor import EnvEditor
 
 SERVICE_NAME = "PlungeTubApp"
+
 
 class SSHForwardServer(threading.Thread):
     def __init__(self, transport, local_port, remote_host, remote_port):
@@ -43,7 +43,6 @@ class SSHForwardServer(threading.Thread):
                     client_sock.close()
                     continue
 
-                # 🔑 this was missing:
                 threading.Thread(
                     target=self.handler, args=(client_sock, chan), daemon=True
                 ).start()
@@ -86,25 +85,23 @@ class SSHForwardServer(threading.Thread):
             client_sock.close()
             chan.close()
 
+
 class SSHDatabaseConnector:
     def __init__(self):
         self.engine = None
         self.client = None
         self.transport = None
         self.forwarder = None
-        self.db_columns = None
+        self.params = {}
 
-        # Reserve free local port
+        # Reserve a free local port for forwarding
         sock = s.socket()
         sock.bind(("127.0.0.1", 0))
         self.local_port = sock.getsockname()[1]
         sock.close()
 
-        # Will be populated by get_env_params()
-        self.params = {}
-
     def get_env_params(self):
-        """Load params from keyring"""
+        """Load params from keyring into self.params"""
         required = [
             "SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PASSWORD",
             "REMOTE_BIND_HOST", "REMOTE_BIND_PORT",
@@ -117,58 +114,58 @@ class SSHDatabaseConnector:
         return required
 
     def connect_over_ssh(self, parent=None):
-        required = [
-            "SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PASSWORD",
-            "REMOTE_BIND_HOST", "REMOTE_BIND_PORT",
-            "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DB"
-        ]
-        try:
-            # Load what we have
+        required = self.get_env_params()
+        missing = [k for k in required if not self.params.get(k)]
+
+        # If missing, open EnvEditor
+        if missing and parent is not None:
+            editor = EnvEditor(parent, required)
+            parent.wait_window(editor)  # wait until Save or Cancel
             self.get_env_params()
-            missing = [k for k in required if not getattr(self, k.lower(), None)]
+            missing = [k for k in required if not self.params.get(k)]
+            if missing:
+                raise RuntimeError(f"Missing required fields after editor: {', '.join(missing)}")
 
-            if missing and parent is not None:
-                editor = EnvEditor(parent, required)
-                parent.wait_window(editor)  # wait for Save or Cancel
-                # reload environment variables again
-                self.get_env_params()
+        # --- SSH client setup ---
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-                # Re-check missing after reload
-                missing = [k for k in required if not getattr(self, k.lower(), None)]
-                if missing:
-                    raise RuntimeError(f"Missing required fields after editor: {', '.join(missing)}")
-
-            # --- SSH client setup ---
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            connect_kwargs = dict(
-                hostname=self.ssh_host,
-                port=self.ssh_port,
-                username=self.ssh_user,
+        try:
+            self.client.connect(
+                hostname=self.params["SSH_HOST"],
+                port=int(self.params["SSH_PORT"]),
+                username=self.params["SSH_USER"],
+                password=self.params["SSH_PASSWORD"],
                 look_for_keys=False,
                 allow_agent=False,
                 timeout=15,
-                password=self.ssh_password,
             )
+        except paramiko.AuthenticationException:
+            raise RuntimeError("SSH authentication failed – please check your username/password")
+        except paramiko.SSHException as e:
+            raise RuntimeError(f"SSH error: {e}")
 
-            try:
-                self.client.connect(**connect_kwargs)
-            except paramiko.AuthenticationException:
-                raise RuntimeError("SSH authentication failed – please check your username/password")
-            except paramiko.SSHException as e:
-                raise RuntimeError(f"SSH error: {e}")
+        self.transport = self.client.get_transport()
+        self.transport.set_keepalive(30)
 
-            self.transport = self.client.get_transport()
-            self.transport.set_keepalive(30)
+        # --- Start forwarder ---
+        self.forwarder = SSHForwardServer(
+            self.transport,
+            self.local_port,
+            self.params["REMOTE_BIND_HOST"],
+            int(self.params["REMOTE_BIND_PORT"])
+        )
+        self.forwarder.start()
 
-            # (forwarder + engine setup same as before…)
+        # --- SQLAlchemy engine ---
+        db_url = (
+            f"mysql+pymysql://{self.params['MYSQL_USER']}:{self.params['MYSQL_PASSWORD']}"
+            f"@127.0.0.1:{self.local_port}/{self.params['MYSQL_DB']}"
+        )
+        self.engine = create_engine(db_url)
 
-            return self.engine
-
-        except Exception as e:
-            print(f"[ERROR] Connection failed: {e}")
-            raise
+        print("[DEBUG] SSH tunnel established, SQLAlchemy engine ready")
+        return self.engine
 
     def disconnect(self):
         if self.engine:
@@ -184,5 +181,4 @@ class SSHDatabaseConnector:
         if self.client:
             self.client.close()
             self.client = None
-
-
+        print("[DEBUG] Disconnected cleanly")

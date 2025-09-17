@@ -1,6 +1,5 @@
 import customtkinter as ctk
 import keyring
-from dotenv import set_key, load_dotenv
 
 SERVICE_NAME = "PlungeTubApp"
 
@@ -12,6 +11,7 @@ class EnvEditor(ctk.CTkToplevel):
         "REMOTE_BIND_PORT": "3306",
         "MYSQL_DB": "cparchivedb"
     }
+
     def __init__(self, master, required_keys):
         super().__init__(master)
         self.title("Configure SSH / Database Connection")
@@ -62,13 +62,14 @@ class EnvEditor(ctk.CTkToplevel):
         cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", fg_color="gray", command=self.on_cancel)
         cancel_btn.pack(side="right", padx=5)
 
-
     def on_save(self):
         for k, entry in self.entries.items():
             val = entry.get().strip()
             if val:
-                set_key(".env", k, val)
-        load_dotenv(override=True)  # 🔑 reload the just-saved values
+                keyring.set_password(SERVICE_NAME, k, val)
+            else:
+                keyring.delete_password(SERVICE_NAME, k)
+
         self.saved = True
         self.destroy()
 

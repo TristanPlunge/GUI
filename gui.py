@@ -1,16 +1,15 @@
 import customtkinter as ctk
 from tkinter import messagebox
-from datetime import datetime, timedelta
 import threading
 import time
-
+from datetime import datetime, timedelta
+from dateutil import parser
 from widgets import CollapsibleSection
 from plot_manager import PlotManager
 from query_manager import QueryManager
 import config_manager
-
 from tksheet import Sheet
-
+from datetime import datetime
 
 class MetricsApp:
     def __init__(self):
@@ -20,6 +19,11 @@ class MetricsApp:
         self.modifiers = set()
         # Core state
         self.df = None
+        # Debug flags
+        self.enable_plot = True  # turn to False to skip PlotManager
+        self.enable_table = True  # turn to False to skip tksheet
+
+        self._timer_after_id = None
 
         self.plot_manager = None
         self.threads = []
@@ -31,7 +35,6 @@ class MetricsApp:
         self.table_drag_start = None
         self.table_panning = False
         self.table_pan_start = None
-        self._row_cache = []  # full data as list-of-lists (all columns)
         self._table_order = []  # current row order (list of row indices)
         self._sorting = False  # debounce flag
         self._sort_dir = {}  # per-column toggle (True=asc, False=desc)
@@ -55,14 +58,24 @@ class MetricsApp:
         self.query_manager = QueryManager(logger=self.log, root=self.root)
         # Load config
         self.config = config_manager.load_config()
+        self._saved_col_states = self.config.get("col_states", {})
+        menubar = ctk.CTkMenu(self.root) if hasattr(ctk, "CTkMenu") else None
+        if menubar is None:
+            from tkinter import Menu
+            menubar = Menu(self.root)
 
+        file_menu = Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Edit Env", command=self.open_env_editor)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.root.config(menu=menubar)
         # Build UI
         self.build_output()
         self.build_controls()
         self.build_log()
 
-        # Try to restore cached plot
-        self.restore_cached_plot()
 
         # Grid weights
         # Root grid config
@@ -89,87 +102,127 @@ class MetricsApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
-        # Bind mouse events for navigation
-
+        self.start_date_entry.bind("<FocusOut>", lambda e: self._normalize_entry(self.start_date_entry))
+        self.end_date_entry.bind("<FocusOut>", lambda e: self._normalize_entry(self.end_date_entry))
 
         # Show window
         self.root.after(50, self.root.deiconify)
 
-    # -------------------------------
-    # Key handling
-    # -------------------------------
-    def _get_current_cell(self):
-        # Try the most specific first
-        try:
-            # tksheet >= 7 returns list of (r,c)
-            cells = self.sheet.get_selected_cells()
-            if cells:
-                r, c = int(cells[0][0]), int(cells[0][1])
-                self._last_cell = (r, c)
-                return r, c
-        except Exception:
-            pass
-
-        try:
-            cur = self.sheet.get_currently_selected()
-            if isinstance(cur, tuple) and len(cur) >= 2:
-                r, c = int(cur[0]), int(cur[1])
-                self._last_cell = (r, c)
-                return r, c
-        except Exception:
-            pass
-
-        # Fallbacks when row/column selection is active
-        try:
-            rows = self.sheet.get_selected_rows()
-            if rows:
-                r = int(rows[0])
-                c = self._last_cell[1]
-                self._last_cell = (r, c)
-                return r, c
-        except Exception:
-            pass
-
-        try:
-            cols = self.sheet.get_selected_columns()
-            if cols:
-                c = int(cols[0])
-                r = self._last_cell[0]
-                self._last_cell = (r, c)
-                return r, c
-        except Exception:
-            pass
-
-        return self._last_cell
-
-    def _set_focus(self, r, c):
-        # clamp to data shape
-        nrows, ncols = self._get_shape()
-        r = max(0, min(r, max(0, nrows - 1)))
-        c = max(0, min(c, max(0, ncols - 1)))
-
-        # prefer select_cell (it updates selection + caret)
-        try:
-            self.sheet.select_cell(r, c, keep_other_selections=False)
-        except Exception:
+    def _cancel_all_afters_shutdown(self):
+        """Cancel every pending Tk 'after' job just before destroying the root."""
+        # 1) cancel our tracked jobs
+        for aid in list(self.after_ids):
             try:
-                self.sheet.set_currently_selected(r, c)
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self.after_ids.clear()
+
+        # 2) cancel the timer loop if running
+        if getattr(self, "_timer_after_id", None):
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
+
+        # 3) best-effort cancel of ALL remaining Tk jobs (CTk, tksheet, lambdas, etc.)
+        try:
+            jobs = self.root.tk.call("after", "info")
+        except Exception:
+            jobs = ()
+        for job in jobs:
+            try:
+                self.root.after_cancel(job)
             except Exception:
                 pass
 
-        # make it visible and ensure keyboard focus is on a tksheet widget
+    def open_env_editor(self):
+        from env_editor import EnvEditor
+        required = [
+            "SSH_HOST", "SSH_PORT", "SSH_USER", "SSH_PASSWORD",
+            "REMOTE_BIND_HOST", "REMOTE_BIND_PORT",
+            "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DB"
+        ]
+        editor = EnvEditor(self.root, required)
+        self.root.wait_window(editor)
+        if editor.saved:
+            # Tear down any existing connection so the next run reconnects with fresh creds
+            try:
+                if self.query_manager:
+                    self.query_manager.close()  # disposes engine & ssh
+                    self.query_manager.engine = None
+                    self.query_manager.connector = None  # force a new connector object
+            except Exception:
+                pass
+            self.log("✅ Environment updated. Connection reset; run the query to reconnect.")
+        else:
+            self.log("⚠️ Environment edit cancelled.")
+    # -------------------------------
+    # Date parsing + validation
+    # -------------------------------
+    def _parse_date_str(self, date_str: str) -> datetime:
+        """Parse user-entered date, defaulting missing year to current year."""
+        today = datetime.today()
+        return parser.parse(date_str, default=today)
+
+    def _get_validated_date_range(self) -> tuple[datetime, datetime]:
+        """Normalize entries, handle blanks, enforce ordering + max 7-day span."""
+        start_str = self.start_date_entry.get().strip()
+        end_str = self.end_date_entry.get().strip()
+
+        # If one side is blank, copy from the other
+        if start_str and not end_str:
+            end_str = start_str
+            self.end_date_entry.delete(0, "end")
+            self.end_date_entry.insert(0, start_str)
+        elif end_str and not start_str:
+            start_str = end_str
+            self.start_date_entry.delete(0, "end")
+            self.start_date_entry.insert(0, end_str)
+
+        # Still both blank? → default to today
+        if not start_str and not end_str:
+            today = datetime.today().strftime("%Y-%m-%d")
+            start_str = end_str = today
+            self.start_date_entry.insert(0, today)
+            self.end_date_entry.insert(0, today)
+
+        # Normalize both
+        start = self._parse_date_str(start_str)
+        end = self._parse_date_str(end_str)
+
+        if end <= start:
+            raise ValueError("End date must be after start date.")
+
+        if (end - start).days > 7:
+            raise ValueError("Date range cannot exceed 7 days.")
+
+        # Write back normalized values
+        self.start_date_entry.delete(0, "end")
+        self.start_date_entry.insert(0, start.strftime("%Y-%m-%d"))
+
+        self.end_date_entry.delete(0, "end")
+        self.end_date_entry.insert(0, end.strftime("%Y-%m-%d"))
+
+        return start, end
+
+    def _normalize_entry(self, entry):
+        """Try to normalize entry text to YYYY-MM-DD."""
+        raw = entry.get().strip()
+        if not raw:
+            return
         try:
-            self.sheet.see(r, c)
+            dt = self._parse_date_str(raw)
+            entry.delete(0, "end")
+            entry.insert(0, dt.strftime("%Y-%m-%d"))
         except Exception:
-            pass
-        try:
-            self.sheet.focus_set()
-        except Exception:
+            # don’t overwrite invalid junk, just leave it
             pass
 
-        self._last_cell = (r, c)
-        self._force_redraw()
-
+    # -------------------------------
+    # Key handling
+    # -------------------------------
     def on_key_press(self, event):
         key = event.keysym
         self.held_keys.add(key)
@@ -221,7 +274,7 @@ class MetricsApp:
     def build_controls(self):
         # --- Filter, Date & Columns collapsible ---
         self.control_frame = ctk.CTkFrame(self.output_frame, corner_radius=12)
-        self.control_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        self.control_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
 
         self.filter_date_section = CollapsibleSection(
             self.control_frame, title="Filter, Date & Columns"
@@ -268,14 +321,20 @@ class MetricsApp:
         self.end_date_entry.pack(anchor="w", padx=5, pady=2)
 
         # ---------------- Columns box ----------------
-        self.col_frame = ctk.CTkFrame(row_frame, corner_radius=8)
-        self.col_frame.pack(side="left", fill="x", expand=True, padx=5, pady=5)
+        # ---------------- Columns box (scrollable) ----------------
+        self.col_scroll = ctk.CTkScrollableFrame(
+            row_frame,
+            corner_radius=8,
+            orientation="horizontal",  # ✅ horizontal scrollbar
+            height=120  # adjust height to your liking
+        )
+        self.col_scroll.pack(side="left", fill="x", expand=True, padx=5, pady=5)
 
-        # Two frames for metrics vs others
-        self.metrics_col_frame = ctk.CTkFrame(self.col_frame, corner_radius=8)
+        # Two frames for metrics vs others, inside the scrollable area
+        self.metrics_col_frame = ctk.CTkFrame(self.col_scroll, corner_radius=8)
         self.metrics_col_frame.pack(side="left", fill="y", padx=5, pady=5)
 
-        self.other_col_frame = ctk.CTkFrame(self.col_frame, corner_radius=8)
+        self.other_col_frame = ctk.CTkFrame(self.col_scroll, corner_radius=8)
         self.other_col_frame.pack(side="left", fill="y", padx=5, pady=5)
 
         # Placeholder dict for column checkboxes (rebuilt in show_table)
@@ -360,24 +419,6 @@ class MetricsApp:
     # -------------------------------
     # Table handling
     # -------------------------------
-    def _to_canvas_xy(self, canvas, event):
-        # translate event coords (from the Sheet widget) to target canvas coords
-        return (event.x_root - canvas.winfo_rootx(),
-                event.y_root - canvas.winfo_rooty())
-
-    def _sync_headers(self):
-        # keep column header (CH) and row index (RI) aligned with the main table (MT)
-        try:
-            x0, _ = self.sheet.MT.xview()
-            self.sheet.CH.xview_moveto(x0)
-        except Exception:
-            pass
-        try:
-            y0, _ = self.sheet.MT.yview()
-            self.sheet.RI.yview_moveto(y0)
-        except Exception:
-            pass
-
     def _clamp_view(self):
         # don’t allow overscroll (prevents “white” edges)
         MT = self.sheet.MT
@@ -411,56 +452,98 @@ class MetricsApp:
 
         self.root.after_idle(_do)
 
+
+    def _ensure_at_least_one_column_selected(self):
+        """Guarantee at least one visible column so the table never renders blank."""
+        selected = [col for col, var in self.col_vars.items() if var.get()]
+        if selected:
+            return selected
+
+        # Prefer updated_at if present, otherwise first column
+        fallback = None
+        if "updated_at" in self.col_vars:
+            fallback = "updated_at"
+        elif self.col_vars:
+            fallback = next(iter(self.col_vars.keys()), None)
+
+        if fallback is not None:
+            self.col_vars[fallback].set(True)
+            return [fallback]
+        return []  # shouldn't happen, but safe
+
     def show_table(self, df, col_states=None):
-        if df is None or df.empty:
+        """Render the table with full data (no custom virtualization).
+           If selected metrics are missing from df, show blank columns for them.
+        """
+        # Empty state: clear the table area and remove any existing Sheet
+        if df is None or df.empty or "updated_at" not in df.columns:
             for widget in self.table_frame.winfo_children():
                 widget.destroy()
-            ctk.CTkLabel(self.table_frame, text="No data available").pack()
+            ctk.CTkLabel(self.table_frame, text="⚠️ No metrics available for this query").pack()
             return
 
+        # Normalize and keep a stable row index for reordering
+        df = df.reset_index(drop=True)
+        self.df = df
+
+        # (Assumes build_column_checkboxes shows all metrics from color_map)
+        self.build_column_checkboxes(df.columns, col_states)
+
+        # Ensure at least one column is selected
+        selected_cols = self._ensure_at_least_one_column_selected()
+
+        # Keep a stable ordering vector for sorting / reordering
+        import numpy as np
+        self._table_order = np.arange(len(df), dtype=int)
+
+        # Compose headers + data matrix, including blanks for missing columns
+        present = [c for c in selected_cols if c in self.df.columns]
+        missing = [c for c in selected_cols if c not in self.df.columns]
+
+        if present:
+            visible_idx = [self.df.columns.get_loc(c) for c in present]
+            full_data = self.df.iloc[self._table_order, visible_idx].to_numpy(copy=False).tolist()
+        else:
+            # No present columns → create empty rows to match row count
+            full_data = [[] for _ in range(len(self._table_order))]
+
+        # Append blank cells for each missing column
+        if missing:
+            for r in full_data:
+                r.extend([""] * len(missing))
+
+        headers = present + missing
+        self._cached_headers = headers
+
+        # Create the sheet if needed
         if not hasattr(self, "sheet"):
-            self.sheet = Sheet(
-                self.table_frame,
-                data=df.values.tolist(),
-                headers=list(df.columns),
-                height=200,
-            )
+            self.sheet = Sheet(self.table_frame, height=200)
             self._bind_sheet_nav_keys()
             self.sheet.enable_bindings((
                 "single_select", "row_select", "column_select", "drag_select", "arrowkeys",
                 "column_width_resize", "row_height_resize", "double_click_column_resize",
                 "copy", "select_all"
             ))
-            self._sort_dir = {}  # e.g. {"updated_at": True}  True=ascending, False=descending
             self.sheet.pack(fill="both", expand=True)
-            # ensure the widget grabs focus on click and initially
+            # Double-click header to sort
+            try:
+                self.sheet.CH.bind("<Double-Button-1>", self._hdr_double_click)
+            except Exception:
+                pass
 
-            self.sheet.focus_set()
-            # Right-click drag bindings for table panning
-            self.sheet.bind("<Button-3>", self.on_table_pan_start)
-            self.sheet.bind("<B3-Motion>", self.on_table_pan_drag)
-            self.sheet.bind("<ButtonRelease-3>", self.on_table_pan_stop)
-            self.sheet.bind("<Double-1>", self._hdr_double_click, add="+")
-            self.sheet.bind("<Button-1>", lambda e: self.sheet.focus_set(), add="+")
-            self.sheet.focus_set()
+        # Preserve current widths across reloads
+        widths = self._get_col_widths()
 
-            # cache all rows once (object keeps mixed types intact)
-            self._row_cache = self.df.astype(object).values.tolist()
-            self._table_order = list(range(len(self._row_cache)))  # identity order
+        # One-shot render (no yscroll handler)
+        self.sheet.headers(self._cached_headers, redraw=False)
+        self.sheet.set_sheet_data(full_data, redraw=False)
+        self.sheet.refresh()
 
+        if widths:
+            self._set_col_widths(widths)
 
-        else:
-            self.sheet.set_sheet_data(df.values.tolist())
-            self.sheet.headers(df.columns.tolist())
-            # cache all rows once (object keeps mixed types intact)
-            self._row_cache = self.df.astype(object).values.tolist()
-            self._table_order = list(range(len(self._row_cache)))  # identity order
-
-        # 🔄 Build checkboxes with states
-        self.build_column_checkboxes(df.columns, col_states)
-
-        # Update visible columns according to checkboxes
-        self.update_table_columns()
+        self.log(f"✅ Table linked with {len(df)} rows and {len(headers)} columns ("
+                 f"{len(present)} present, {len(missing)} missing).")
 
     def _get_col_widths(self):
         # derive widths from current col_positions (most robust across tksheet versions)
@@ -516,10 +599,10 @@ class MetricsApp:
         if self._is_near_header_divider(event):
             return
         # Reuse your sorter (decides column & toggles direction)
-        self._maybe_sort_by_header(event)
+        self.sort_by_header_click(event)
 
     def _is_near_header_divider(self, event, eps=6):
-        """Return True if pointer is within `eps` px of a column divider in the header."""
+        """Return True if pointer is within eps px of a column divider in the header."""
         try:
             # x in ColumnHeader *widget* coords
             ch = self.sheet.CH
@@ -569,70 +652,22 @@ class MetricsApp:
         except Exception:
             pass
 
-    def _goto_x(self, frac: float):
-        MT = self.sheet.MT
-        x0, x1 = MT.xview()
-        win_w = max(1e-9, x1 - x0)
-        left = max(0.0, min(1.0 - win_w, frac))
-        MT.xview_moveto(left)
-        self._sync_headers()
-        self._force_redraw()  # <-- important
-
-    def _goto_y(self, frac: float):
-        MT = self.sheet.MT
-        y0, y1 = MT.yview()
-        win_h = max(1e-9, y1 - y0)
-        top = max(0.0, min(1.0 - win_h, frac))
-        MT.yview_moveto(top)
-        self._sync_headers()
-        self._force_redraw()  # <-- important
-
     def _get_shape(self):
-        # rows = current order (displayed), cols = visible columns only
+        """Shape of the logical table (selected rows, selected columns)."""
         try:
-            nrows = len(self._table_order) if self._table_order else (len(self.df) if self.df is not None else 0)
-            if self.df is not None:
-                visible_cols = [i for i, col in enumerate(self.df.columns) if self.col_vars[col].get()]
-                ncols = len(visible_cols)
-            else:
-                ncols = 0
+            nrows = len(self._table_order) if getattr(self, "_table_order", None) is not None else (
+                len(self.df) if self.df is not None else 0)
+            ncols = sum(1 for col, var in self.col_vars.items() if var.get())
         except Exception:
             nrows, ncols = 0, 0
         return nrows, ncols
 
-    def _get_current_cell(self):
-        try:
-            cur = self.sheet.get_currently_selected()
-            if isinstance(cur, tuple) and len(cur) >= 2:
-                return int(cur[0]), int(cur[1])
-        except Exception:
-            pass
-        return 0, 0
-
-    def _set_focus(self, r, c):
-        r = max(0, r);
-        c = max(0, c)
-        try:
-            self.sheet.set_currently_selected(r, c)
-        except Exception:
-            pass
-        try:
-            # if available in your tksheet version
-            self.sheet.see(r, c)
-        except Exception:
-            pass
-        self._force_redraw()
-
     # ---------- NAV + VIEW HELPERS (add to class) ----------
     def _visible_shape(self):
-        """Rows/cols for the currently visible sheet data."""
-        try:
-            data = self.sheet.get_sheet_data(return_copy=False)
-            nrows = len(data)
-            ncols = len(data[0]) if data else 0
-            return nrows, ncols
-        except Exception:
-            return 0, 0
+        nrows = len(self._table_order) if getattr(self, "_table_order", None) is not None else (
+            len(self.df) if self.df is not None else 0)
+        ncols = len(self._cached_headers) if hasattr(self, "_cached_headers") and self._cached_headers else 0
+        return nrows, ncols
 
     def _get_current_cell(self):
         try:
@@ -712,8 +747,6 @@ class MetricsApp:
         self._set_focus(max(0, nrows - 1), c)
         return "break"
 
-    # (same pattern for the other three)
-
     def _nav_top_left(self, event=None):
         self._goto_y(0.0);
         self._goto_x(0.0)
@@ -735,30 +768,29 @@ class MetricsApp:
             widget.destroy()
 
         self.col_vars = {}
-        max_rows = 4
+        max_rows = 3
 
-        metrics = [col for col in columns if col in self.color_map]
+        # ✅ Always show metrics from the color_map, even if not in df
+        metrics = list(self.color_map.keys())
+
+        # Others = whatever the DF actually has besides metrics
         others = [col for col in columns if col not in self.color_map]
 
-        # --- helpers ---
         def update_select_all_states():
-            # Metrics group
             if metrics:
-                self.metrics_toggle.set(all(self.col_vars[c].get() for c in metrics))
+                self.metrics_toggle.set(all(self.col_vars[c].get() for c in metrics if c in self.col_vars))
             else:
                 self.metrics_toggle.set(False)
-            # Others group
             if others:
-                self.other_toggle.set(all(self.col_vars[c].get() for c in others))
+                self.other_toggle.set(all(self.col_vars[c].get() for c in others if c in self.col_vars))
             else:
                 self.other_toggle.set(False)
 
         def per_box_cmd():
-            # Called when any individual checkbox is toggled
             self.on_column_change()
             update_select_all_states()
 
-        # --- Metrics checkboxes ---
+        # --- Metrics checkboxes (always) ---
         for i, col in enumerate(metrics):
             default_val = col_states.get(col, True) if col_states else True
             var = ctk.BooleanVar(value=default_val)
@@ -773,9 +805,7 @@ class MetricsApp:
             chk.grid(row=i % max_rows, column=i // max_rows, padx=5, pady=5, sticky="w")
             self.col_vars[col] = var
 
-        # Select All (metrics)
         if metrics:
-            # initialize based on current states
             self.metrics_toggle.set(all(self.col_vars[c].get() for c in metrics))
             row = len(metrics) % max_rows
             col = len(metrics) // max_rows
@@ -786,7 +816,7 @@ class MetricsApp:
                 command=lambda: (self.toggle_metrics(), update_select_all_states()),
             ).grid(row=row, column=col, padx=5, pady=5, sticky="w")
 
-        # --- Other checkboxes ---
+        # --- Other checkboxes (only those present in df) ---
         for i, col in enumerate(others):
             default_val = col_states.get(col, True) if col_states else True
             var = ctk.BooleanVar(value=default_val)
@@ -799,7 +829,6 @@ class MetricsApp:
             chk.grid(row=i % max_rows, column=i // max_rows, padx=5, pady=5, sticky="w")
             self.col_vars[col] = var
 
-        # Select All (others)
         if others:
             self.other_toggle.set(all(self.col_vars[c].get() for c in others))
             row = len(others) % max_rows
@@ -811,58 +840,74 @@ class MetricsApp:
                 command=lambda: (self.toggle_others(), update_select_all_states()),
             ).grid(row=row, column=col, padx=5, pady=5, sticky="w")
 
+    def _compose_table_matrix(self, selected_cols):
+        """Return (headers, data) including blank columns for metrics not in df."""
+        if self.df is None:
+            return [], []
+
+        present = [c for c in selected_cols if c in self.df.columns]
+        missing = [c for c in selected_cols if c not in self.df.columns]
+
+        # Build data for present columns
+        import numpy as np
+        idxs = [self.df.columns.get_loc(c) for c in present]
+        arr = self.df.iloc[self._table_order, idxs].to_numpy(copy=False) if present else np.empty(
+            (len(self._table_order), 0))
+        data = arr.tolist()
+
+        # Append blanks for missing columns
+        if missing:
+            for r in data:
+                r.extend([""] * len(missing))
+
+        headers = present + missing
+        return headers, data
+
     # -------------------------------
     # Cache + log + timer helpers (unchanged from before)
     # -------------------------------
-    def restore_cached_plot(self):
-        df, columns, col_states = self.plot_manager.load_cache()
-        if df is not None and not df.empty:
-            self.df = df
-
-            # plot only saved metrics
-            self.plot_manager.plot_data(df, columns, fresh=True, color_map=self.color_map)
-
-            # pass saved states into show_table
-            self.show_table(df, col_states)
-
-            self.on_column_change()  # apply to plot
-
-            self.log("📂 Restored last cached plot.")
-
-            device_val = df["device_name"].dropna().iloc[0] if "device_name" in df else "?"
-            user_val = df["user_id"].dropna().iloc[0] if "user_id" in df else "?"
-            self.status_label.configure(
-                text=f"Device: {device_val} | User: {user_val}"
-            )
 
     def log(self, message: str):
         if self.is_closing:
             return
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] {message}")
-        try:
-            self.log_text.insert("end", f"[{timestamp}] {message}\n")
-            self.log_text.see("end")
-            self.root.update_idletasks()
-        except Exception:
-            pass
+
+        def _append():
+            try:
+                self.log_text.insert("end", f"[{timestamp}] {message}\n")
+                self.log_text.see("end")
+                # remove update_idletasks() — it can cause re-entrancy hiccups
+            except Exception:
+                pass
+
+        # Only touch Tk on the main thread
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.safe_after(0, _append)
 
     def start_timer(self):
         self.query_start_time = time.time()
         self.timer_running = True
         self.update_timer()
 
-    def stop_timer(self):
-        self.timer_running = False
-        self.cancel_afters()
-
     def update_timer(self):
         if self.is_closing or not self.timer_running:
             return
         elapsed = time.time() - self.query_start_time
         self.timer_label.configure(text=f"⏱ Elapsed: {elapsed:.1f}s")
-        if not self.is_closing:
-            self.safe_after(100, self.update_timer)
+        # keep the id so we can cancel *just* this loop
+        self._timer_after_id = self.root.after(100, self.update_timer)
+
+    def stop_timer(self):
+        self.timer_running = False
+        if self._timer_after_id:
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
 
     def safe_after(self, delay, func, *args, **kwargs):
         if self.is_closing:
@@ -882,17 +927,8 @@ class MetricsApp:
             except Exception as e:
                 self.log(f"[AFTER] Failed to cancel id={aid}: {e}")
         self.after_ids.clear()
-        try:
-            jobs = self.root.tk.call("after", "info")
-            for job in jobs:
-                try:
-                    self.root.after_cancel(job)
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
-    def _maybe_sort_by_header(self, event):
+    def sort_by_header_click(self, event):
         # Only header clicks
         try:
             if self.sheet.identify_region(event) != "header":
@@ -900,20 +936,23 @@ class MetricsApp:
             vis_col = self.sheet.identify_column(event, exclude_header=False)
         except Exception:
             return
+
         if vis_col is None or self.df is None or self.df.empty:
             return
 
+        # Map visible column index -> real df column index
         visible_cols = [i for i, col in enumerate(self.df.columns) if self.col_vars[col].get()]
         if not (0 <= vis_col < len(visible_cols)):
             return
+
         col_idx = visible_cols[vis_col]
         col_name = self.df.columns[col_idx]
 
-        # toggle direction per column
+        # Toggle direction per column
         asc = self._sort_dir.get(col_name, True)
         self._sort_dir[col_name] = not asc
 
-        # remember scroll to avoid white flash/jumps
+        # Remember scroll
         MT = self.sheet.MT
         try:
             x0, _ = MT.xview()
@@ -921,33 +960,34 @@ class MetricsApp:
         except Exception:
             x0 = y0 = 0.0
 
-        def worker():
-            def keynorm(v):
-                if v is None:
-                    return (1, 0, "")
-                if isinstance(v, (int, float)):
-                    return (0, 0, v)
-                return (0, 1, str(v).lower())
+        import threading
+        import pandas as pd
+        import numpy as np
 
+        def keynorm(v):
+            # Place NaNs at bottom; compare numbers as numbers, others by casefolded str
+            if pd.isna(v):
+                return (1, 0, "")
+            if isinstance(v, (int, float, np.number)):
+                return (0, 0, float(v))
+            return (0, 1, str(v).casefold())
+
+        def worker():
+            order_idx = list(range(len(self._table_order)))
             try:
-                new_order = sorted(
-                    self._table_order,
-                    key=lambda i: keynorm(self._row_cache[i][col_idx]),
-                    reverse=not asc,
-                )
+                series = self.df.iloc[self._table_order, col_idx]
+                order_idx.sort(key=lambda i: keynorm(series.iat[i]), reverse=not asc)
+                new_order = [self._table_order[i] for i in order_idx]
             except Exception:
-                # defensive fallback
-                new_order = sorted(
-                    self._table_order,
-                    key=lambda i: (self._row_cache[i][col_idx] is None,
-                                   str(self._row_cache[i][col_idx]).lower()),
-                    reverse=not asc,
-                )
+                # Fallback: safe but slower path
+                series = [self.df.iat[r, col_idx] for r in self._table_order]
+                order_idx.sort(key=lambda i: keynorm(series[i]), reverse=not asc)
+                new_order = [self._table_order[i] for i in order_idx]
 
             def apply():
                 self._apply_row_order(new_order)
                 try:
-                    MT.xview_moveto(x0);
+                    MT.xview_moveto(x0)
                     MT.yview_moveto(y0)
                     self._sync_headers()
                 except Exception:
@@ -975,6 +1015,7 @@ class MetricsApp:
         self.table_panning = True
         mx, my = self._to_canvas_xy(self.sheet.MT, event)
         self.sheet.MT.scan_mark(mx, my)
+        self._last_scan_xy = (mx, my)  # ✅ reset tracking
 
     def on_table_pan_drag(self, event):
         if not self.table_panning:
@@ -1043,36 +1084,55 @@ class MetricsApp:
             if not self.query_manager.connect():
                 self.log("⏹ Query aborted (no DB connection).")
                 return  # stop cleanly if cancelled
+
             # If no checkboxes yet (first run / no cache), request ALL columns
             sel_cols = self.get_selected_table_columns()
-            if not sel_cols:  # <- key line
+            if not sel_cols:
                 sel_cols = None  # None = ask QueryManager for all columns
+
+            try:
+                start, end = self._get_validated_date_range()
+            except ValueError as e:
+                self.safe_after(0, messagebox.showerror, "Invalid Dates", str(e))
+                return
 
             df = self.query_manager.run_query(
                 filter_type=self.filter_type.get(),
                 filter_value=self.filter_value.get(),
-                start_date_str=self.start_date_entry.get(),
-                end_date_str=self.end_date_entry.get(),
-                selected_columns=sel_cols  # pass None or full list
+                start_date_str=start.strftime("%Y-%m-%d"),
+                end_date_str=end.strftime("%Y-%m-%d"),
+                selected_columns=sel_cols
             )
 
             self.df = df
-            if "updated_at" not in df.columns:
-                raise ValueError("Expected column 'updated_at' not found in query results.")
-
             if df.empty:
-                self.log("⚠️ Query returned no results for the given filter/date range.")
+                self.log("⚠️ No metrics available for the given filter/date range.")
             else:
                 self.log(f"Query complete. Retrieved {len(df)} rows.")
 
             def _render_first_time():
-                # 1) build the table so checkboxes exist
-                self.show_table(df, None)
-                # 2) get current metric selection; if none yet, let PlotManager auto-pick
-                metrics = self.get_selected_metrics()
-                sel = metrics if metrics else None
-                self.plot_manager.plot_data(df, sel, True, self.color_map)
+                # ✅ Always build checkboxes for both table & plot
+                self.build_column_checkboxes(df.columns, getattr(self, "_saved_col_states", None))
+                self._saved_col_states = None
 
+                if self.enable_table:
+                    self.show_table(df)
+
+                if self.enable_plot:
+                    metrics = self.get_selected_metrics()
+                    sel = metrics if metrics else None
+                    self.plot_manager.plot_data(df, sel, True, self.color_map)
+
+                    # Force the x-axis to the exact LA calendar window from the entries
+                    s = datetime.fromisoformat(self.start_date_entry.get()).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    e = datetime.fromisoformat(self.end_date_entry.get()).replace(
+                        hour=23, minute=59, second=59, microsecond=999999
+                    )
+                    self.plot_manager.set_time_window(s, e)
+
+            # Schedule rendering on the main thread
             self.safe_after(0, _render_first_time)
 
             if not df.empty:
@@ -1083,13 +1143,6 @@ class MetricsApp:
                     self.status_label.configure,
                     {"text": f"Device: {device_val} | User: {user_val} | Step: Minute"}
                 )
-            # Save cache with full checkbox states
-            self.plot_manager._save_cache(
-                df,
-                self.get_selected_metrics(),  # metrics that were plotted
-                {col: var.get() for col, var in self.col_vars.items()}  # full states
-            )
-
 
         except Exception as e:
             if not self.is_closing:
@@ -1097,86 +1150,48 @@ class MetricsApp:
                 self.safe_after(0, messagebox.showerror, "Error", str(e))
 
         finally:
-            self.stop_timer()
+            self.safe_after(0, self.stop_timer)
 
     def on_column_change(self):
         if self.df is not None:
-            self.plot_manager.plot_data(
-                self.df, self.get_selected_metrics(), fresh=False, color_map=self.color_map
-            )
-            self.update_table_columns()
+            if self.enable_plot:
+                self.plot_manager.plot_data(
+                    self.df, self.get_selected_metrics(), fresh=False, color_map=self.color_map
+                )
+            if self.enable_table:
+                self.update_table_columns()
+            ...
 
             # keep "Select All" boxes in sync with individual boxes
             self._update_select_all_checks()
 
-            self.plot_manager._save_cache(
-                self.df,
-                self.get_selected_metrics(),
-                {col: var.get() for col, var in self.col_vars.items()}
-            )
-
     def update_table_columns(self):
         if not hasattr(self, "sheet") or self.df is None:
             return
+        widths = self._get_col_widths()
+        selected_cols = self._ensure_at_least_one_column_selected()
+        self._cached_headers, full_data = self._compose_table_matrix(selected_cols)
+        self.sheet.headers(self._cached_headers, redraw=False)
+        self.sheet.set_sheet_data(full_data, redraw=False)
+        self.sheet.refresh()
 
-        MT = self.sheet.MT
-        try:
-            x0, _ = MT.xview()
-            y0, _ = MT.yview()
-        except Exception:
-            x0 = y0 = 0.0
-
-        # Snapshot widths only if the visible column count stays the same
-        try:
-            old_w = self._get_col_widths()
-            old_count = len(old_w)
-        except Exception:
-            old_w = None
-            old_count = None
-
-        visible_cols = [i for i, col in enumerate(self.df.columns) if self.col_vars[col].get()]
-        ordered_rows = [self._row_cache[i] for i in self._table_order]
-        visible_data = [[row[j] for j in visible_cols] for row in ordered_rows]
-
-        # Update without intermediate redraws
-        try:
-            # If your tksheet version supports redraw=False, use it:
-            self.sheet.set_sheet_data(visible_data, redraw=False)
-            self.sheet.headers([self.df.columns[i] for i in visible_cols], redraw=False)
-        except TypeError:
-            self.sheet.set_sheet_data(visible_data)
-            self.sheet.headers([self.df.columns[i] for i in visible_cols])
-
-        # Restore scroll position
-        try:
-            MT.xview_moveto(x0)
-            MT.yview_moveto(y0)
-            self._sync_headers()
-        except Exception:
-            pass
-
-        # Restore widths only if column count unchanged; otherwise let tksheet recalc
-        try:
-            if old_w is not None and old_count == len(visible_cols):
-                self._set_col_widths(old_w)
-        except Exception:
-            pass
-
-        self._force_redraw()
+        # Only reapply widths if shape didn’t change
+        if widths and len(widths) == len(self._cached_headers):
+            self._set_col_widths(widths)
 
     def _apply_row_order(self, new_order):
-        if not hasattr(self, "sheet"):
+        if self.df is None or not hasattr(self, "sheet"):
             return
-        self._table_order = new_order
-        # Only rebuild the data matrix; headers & column visibility are unchanged
-        visible_cols = [i for i, col in enumerate(self.df.columns) if self.col_vars[col].get()]
-        ordered_rows = [self._row_cache[i] for i in new_order]
-        visible_data = [[row[j] for j in visible_cols] for row in ordered_rows]
-        try:
-            self.sheet.set_sheet_data(visible_data, redraw=False)
-        except TypeError:
-            self.sheet.set_sheet_data(visible_data)
-        self._force_redraw()
+        import numpy as np
+        self._table_order = np.array(new_order, dtype=int)
+        widths = self._get_col_widths()
+        selected_cols = self._ensure_at_least_one_column_selected()
+        self._cached_headers, full_data = self._compose_table_matrix(selected_cols)
+        self.sheet.headers(self._cached_headers, redraw=False)
+        self.sheet.set_sheet_data(full_data, redraw=False)
+        self.sheet.refresh()
+        if widths:
+            self._set_col_widths(widths)
 
     def on_select(self, eclick, erelease):
         pass
@@ -1190,6 +1205,13 @@ class MetricsApp:
         self.is_closing = True
         self.log("[CLOSE] Starting shutdown sequence")
 
+        # (optional) disable UI so nothing else fires
+        try:
+            self.run_btn.configure(state="disabled")
+        except Exception:
+            pass
+
+        # Save config (unchanged)
         try:
             state = self.root.state()
             cfg = {
@@ -1198,30 +1220,34 @@ class MetricsApp:
                 "start_date": self.start_date_entry.get(),
                 "end_date": self.end_date_entry.get(),
                 "columns": self.get_selected_table_columns(),
+                "col_states": {col: var.get() for col, var in self.col_vars.items()},
                 "window_state": state,
             }
-
             if state == "normal":
                 cfg["window_size"] = self.root.geometry()
-
-            # Save collapsible states
             cfg["collapsible_states"] = {
                 "filter_date": self.filter_date_section.get_state(),
                 "table": self.table_section.get_state(),
                 "log": self.log_section.get_state(),
             }
-
             config_manager.save_config(cfg)
             self.log("[CLOSE] Saved config")
         except Exception as e:
             self.log(f"[CLOSE] Failed to save config: {e}")
 
-        self.cancel_afters()
+        # hard-stop the timer loop and ALL pending after jobs
+        self._cancel_all_afters_shutdown()
 
+        # let worker threads die on their own (daemon=True), don’t join
         for t in self.threads:
             if t.is_alive():
                 self.log(f"[CLOSE] Thread {t.name} still alive, skipping join")
 
+        # close fast without giving Tk time to run more after callbacks
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
         try:
             self.root.quit()
         except Exception:
@@ -1233,3 +1259,4 @@ class MetricsApp:
 
     def run(self):
         self.root.mainloop()
+
