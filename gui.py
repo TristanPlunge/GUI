@@ -479,7 +479,6 @@ class MetricsApp:
         if df is None or df.empty or "updated_at" not in df.columns:
             for widget in self.table_frame.winfo_children():
                 widget.destroy()
-            ctk.CTkLabel(self.table_frame, text="⚠️ No metrics available for this query").pack()
             return
 
         # Normalize and keep a stable row index for reordering

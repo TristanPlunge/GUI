@@ -55,7 +55,25 @@ class QueryManager:
             "end_date": end_la.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+        # --- 🔎 Pre-check for any data points ---
+        check_query = text(f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM cp_device_metrics
+                WHERE {filter_type} = :filter_value
+                  AND updated_at BETWEEN :start_date AND :end_date
+            ) AS has_data;
+        """)
 
+        with self.engine.connect() as conn:
+            has_data = conn.execute(check_query, params).scalar()
+
+        if not has_data:
+            self.logger("⚠️ No data points in this time range.")
+            return pd.DataFrame()
+
+        # --- If we get here, we know at least one row exists ---
+        cols = ", ".join(selected_columns) if selected_columns else "*"
         query = text(f"""
             SELECT *
             FROM cp_device_metrics
@@ -64,25 +82,13 @@ class QueryManager:
             LIMIT 30000;
         """)
 
-        t0 = time.time()
         with self.engine.connect().execution_options(stream_results=True) as conn:
-            t1 = time.time()
             result = conn.execute(query, params)
-            self.logger(f"[TIMING] Query executed in {time.time() - t1:.2f} sec")
+            df = pd.DataFrame(result.fetchall(), columns=result.keys())
 
-            t2 = time.time()
-            rows = result.fetchall()
-            self.logger(f"[TIMING] Rows fetched in {time.time() - t2:.2f} sec")
-
-            t3 = time.time()
-            df = pd.DataFrame(rows, columns=result.keys())
-            self.logger(f"[TIMING] DataFrame built in {time.time() - t3:.2f} sec")
-
-        self.logger(f"[TIMING] Total run_query time: {time.time() - t0:.2f} sec")
-
-        # --- Now safe to process df as before ---
+        # --- Continue with your normalization logic ---
         if df.empty:
-            self.logger("⚠️ No metrics: query returned 0 rows.")
+            self.logger("⚠️ No metrics: query returned 0 rows (unexpected).")
             return df
 
         df.columns = [c.lower() for c in df.columns]

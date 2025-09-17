@@ -108,7 +108,14 @@ class PlotManager:
 
             # Ensure datetime column & tz-naive
             if "updated_at" not in df.columns:
-                raise ValueError("DataFrame must contain an 'updated_at' column")
+                self.ax.text(
+                    0.5, 0.5, "No results",
+                    ha="center", va="center", transform=self.ax.transAxes,
+                    fontsize=14, color="red"
+                )
+                self.canvas.draw_idle()
+                self.current_df = pd.DataFrame()  # reset state
+                return
 
             # Only parse if not already datetime64[ns]
             if not pd.api.types.is_datetime64_any_dtype(df["updated_at"]):
