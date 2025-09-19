@@ -3,6 +3,8 @@ from tkinter import messagebox
 import threading
 import time
 from datetime import datetime, timedelta
+
+from attr.validators import disabled
 from dateutil import parser
 from widgets import CollapsibleSection
 from plot_manager import PlotManager
@@ -22,7 +24,7 @@ class MetricsApp:
         # Debug flags
         self.enable_plot = True  # turn to False to skip PlotManager
         self.enable_table = True  # turn to False to skip tksheet
-
+        self.query_running = False  # 🚦 prevents multiple runs
         self._timer_after_id = None
 
         self.plot_manager = None
@@ -104,6 +106,8 @@ class MetricsApp:
         self.root.bind("<KeyRelease>", self.on_key_release)
         self.start_date_entry.bind("<FocusOut>", lambda e: self._normalize_entry(self.start_date_entry))
         self.end_date_entry.bind("<FocusOut>", lambda e: self._normalize_entry(self.end_date_entry))
+        self.start_date_entry.bind("<Return>", lambda e: self._normalize_entry(self.start_date_entry))
+        self.end_date_entry.bind("<Return>", lambda e: self._normalize_entry(self.end_date_entry))
 
         # Show window
         self.root.after(50, self.root.deiconify)
@@ -413,7 +417,7 @@ class MetricsApp:
         self.log_section.content.grid_rowconfigure(0, weight=1)
         self.log_section.content.grid_columnconfigure(0, weight=1)
 
-        self.log_text = ctk.CTkTextbox(self.log_section.content, height=100)
+        self.log_text = ctk.CTkTextbox(self.log_section.content, height=80,state="disabled")
         self.log_text.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
     # -------------------------------
@@ -1052,10 +1056,18 @@ class MetricsApp:
     # Events
     # -------------------------------
     def on_run(self):
+        if self.query_running:
+            self.log("⚠️ Query already in progress, please wait...")
+            return
+
         if not self.filter_value.get().strip():
             messagebox.showerror("Error", "Filter Value cannot be empty.")
             return
+
+        self.query_running = True
+        self.run_btn.configure(state="disabled")  # gray out button
         self.start_timer()
+
         t = threading.Thread(target=self._run_query_worker, daemon=True)
         self.threads.append(t)
         t.start()
@@ -1087,7 +1099,7 @@ class MetricsApp:
             # If no checkboxes yet (first run / no cache), request ALL columns
             sel_cols = self.get_selected_table_columns()
             if not sel_cols:
-                sel_cols = None  # None = ask QueryManager for all columns
+                sel_cols = None
 
             try:
                 start, end = self._get_validated_date_range()
@@ -1110,7 +1122,6 @@ class MetricsApp:
                 self.log(f"Query complete. Retrieved {len(df)} rows.")
 
             def _render_first_time():
-                # ✅ Always build checkboxes for both table & plot
                 self.build_column_checkboxes(df.columns, getattr(self, "_saved_col_states", None))
                 self._saved_col_states = None
 
@@ -1122,7 +1133,6 @@ class MetricsApp:
                     sel = metrics if metrics else None
                     self.plot_manager.plot_data(df, sel, True, self.color_map)
 
-                    # Force the x-axis to the exact LA calendar window from the entries
                     s = datetime.fromisoformat(self.start_date_entry.get()).replace(
                         hour=0, minute=0, second=0, microsecond=0
                     )
@@ -1131,7 +1141,6 @@ class MetricsApp:
                     )
                     self.plot_manager.set_time_window(s, e)
 
-            # Schedule rendering on the main thread
             self.safe_after(0, _render_first_time)
 
             if not df.empty:
@@ -1149,7 +1158,10 @@ class MetricsApp:
                 self.safe_after(0, messagebox.showerror, "Error", str(e))
 
         finally:
+            # ✅ Always reset safely on main thread
             self.safe_after(0, self.stop_timer)
+            self.safe_after(0, lambda: self.run_btn.configure(state="normal"))
+            self.safe_after(0, lambda: setattr(self, "query_running", False))
 
     def on_column_change(self):
         if self.df is not None:

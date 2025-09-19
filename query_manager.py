@@ -64,6 +64,8 @@ class QueryManager:
                   AND updated_at BETWEEN :start_date AND :end_date
             ) AS has_data;
         """)
+        self.logger(f"Checking for data with filter={filter_type}={filter_value}, "
+                    f"start={start_la.strftime("%Y-%m-%d %H:%M:%S")}, end={end_la.strftime("%Y-%m-%d %H:%M:%S")}")
 
         with self.engine.connect() as conn:
             has_data = conn.execute(check_query, params).scalar()
