@@ -267,6 +267,10 @@ class PlotManager:
         lines = [row["updated_at"].strftime("%Y-%m-%d %H:%M:%S")]
         colors = ["white"]
 
+        if "device_name" in row and pd.notna(row["device_name"]):
+            lines.append(f"Device: {row['device_name']}")
+            colors.append("white")  # or "white" if you want consistent
+
         # Add metric values with their line colors
         for col in self.current_columns:
             if col in row and pd.notna(row[col]):

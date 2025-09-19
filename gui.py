@@ -3,7 +3,6 @@ from tkinter import messagebox
 import threading
 import time
 from datetime import datetime, timedelta
-
 from attr.validators import disabled
 from dateutil import parser
 from widgets import CollapsibleSection
@@ -76,14 +75,14 @@ class MetricsApp:
         # Build UI
         self.build_output()
         self.build_controls()
-        self.build_log()
+        #self.build_log()
 
 
         # Grid weights
         # Root grid config
         self.root.grid_rowconfigure(0, weight=0)  # controls fixed
         self.root.grid_rowconfigure(1, weight=1)  # output flex
-        self.root.grid_rowconfigure(2, weight=0)  # log collapsible
+        #self.root.grid_rowconfigure(2, weight=0)  # log collapsible
         self.root.grid_columnconfigure(0, weight=1)
 
         # Restore window size/state
@@ -98,7 +97,7 @@ class MetricsApp:
         states = self.config.get("collapsible_states", {})
         self.filter_date_section.set_state(states.get("filter_date", "expanded"))
         self.table_section.set_state(states.get("table", "expanded"))
-        self.log_section.set_state(states.get("log", "expanded"))
+        #self.log_section.set_state(states.get("log", "expanded"))
 
         # Protocols/bindings
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -405,7 +404,7 @@ class MetricsApp:
         self.timer_label.pack(side="left", padx=10)
 
         self.status_label = ctk.CTkLabel(
-            self.run_frame, text="Device: N/A | User: N/A | Step: Minute"
+            self.run_frame, text="Device: N/A | User: N/A | Min/Max Time range: N/A"
         )
         self.status_label.pack(side="left", padx=10)
 
@@ -1146,11 +1145,23 @@ class MetricsApp:
             if not df.empty:
                 device_val = df["device_name"].dropna().iloc[0] if "device_name" in df else self.filter_value.get()
                 user_val = df["user_id"].dropna().iloc[0] if "user_id" in df else "?"
-                self.safe_after(
-                    0,
-                    self.status_label.configure,
-                    {"text": f"Device: {device_val} | User: {user_val} | Step: Minute"}
-                )
+
+                earliest, latest = getattr(self.query_manager, "timestamp_range", (None, None))
+
+                if earliest is not None and latest is not None:
+                    ts_range = f"{earliest.strftime('%Y-%m-%d %H:%M')} → {latest.strftime('%Y-%m-%d %H:%M')}"
+                else:
+                    ts_range = "N/A"
+
+                self.log(f"[DEBUG GUI] Updating status label with Range={ts_range}")
+
+                def _update_status():
+                    self.status_label.configure(
+                        text=f"Device: {device_val} | User: {user_val} | Min/Max Time range: {ts_range}"
+                    )
+
+                self.safe_after(0, _update_status)
+
 
         except Exception as e:
             if not self.is_closing:

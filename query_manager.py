@@ -3,7 +3,7 @@ import pytz
 from sqlalchemy import text
 from datetime import datetime
 from ssh_db_connector import SSHDatabaseConnector
-import time
+
 LA_TZ = pytz.timezone("America/Los_Angeles")
 
 
@@ -18,6 +18,9 @@ class QueryManager:
         self.logger = logger or (lambda msg: print(msg))
         self.units = units.lower()
         self.root = root
+        # (earliest_local_naive_datetime, latest_local_naive_datetime)
+        self.timestamp_range = (None, None)
+
     # -------------------------------
     # Connection handling
     # -------------------------------
@@ -64,17 +67,48 @@ class QueryManager:
                   AND updated_at BETWEEN :start_date AND :end_date
             ) AS has_data;
         """)
-        self.logger(f"Checking for data with filter={filter_type}={filter_value}, "
-                    f"start={start_la.strftime("%Y-%m-%d %H:%M:%S")}, end={end_la.strftime("%Y-%m-%d %H:%M:%S")}")
+        self.logger(
+            f"Checking for data with filter={filter_type}={filter_value}, "
+            f"start={start_la.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"end={end_la.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
         with self.engine.connect() as conn:
             has_data = conn.execute(check_query, params).scalar()
 
         if not has_data:
+            self.timestamp_range = (None, None)
             self.logger("⚠️ No data points in this time range.")
             return pd.DataFrame()
 
-        # --- If we get here, we know at least one row exists ---
+        # --- 🔎 Get true earliest/latest timestamps for this filter (ignoring date range) ---
+        range_query = text(f"""
+            SELECT MIN(updated_at) AS earliest, MAX(updated_at) AS latest
+            FROM cp_device_metrics
+            WHERE {filter_type} = :filter_value
+        """)
+        with self.engine.connect() as conn:
+            row = conn.execute(range_query, {"filter_value": filter_value}).first()
+            if row and row[0] and row[1]:
+                earliest = (
+                    pd.to_datetime(row[0])
+                    .tz_localize("UTC")     # assume DB is UTC
+                    .tz_convert(LA_TZ)
+                    .tz_localize(None)
+                )
+                latest = (
+                    pd.to_datetime(row[1])
+                    .tz_localize("UTC")
+                    .tz_convert(LA_TZ)
+                    .tz_localize(None)
+                )
+                self.timestamp_range = (earliest, latest)
+                self.logger(f"[RANGE] Earliest={earliest}, Latest={latest}")
+            else:
+                self.timestamp_range = (None, None)
+                self.logger("[RANGE] No overall timestamps found for this filter")
+
+        # --- Main data query (limited by date range) ---
         cols = ", ".join(selected_columns) if selected_columns else "*"
         query = text(f"""
             SELECT *
@@ -88,7 +122,7 @@ class QueryManager:
             result = conn.execute(query, params)
             df = pd.DataFrame(result.fetchall(), columns=result.keys())
 
-        # --- Continue with your normalization logic ---
+        # --- Continue with normalization ---
         if df.empty:
             self.logger("⚠️ No metrics: query returned 0 rows (unexpected).")
             return df
@@ -145,6 +179,13 @@ class QueryManager:
             self.logger(f"Columns after normalization: {list(df.columns)}")
 
         return df
+
+    # -------------------------------
+    # Optional: expose a getter
+    # -------------------------------
+    def get_timestamp_range(self):
+        """Return (earliest_local_naive, latest_local_naive) or (None, None)."""
+        return self.timestamp_range
 
     # -------------------------------
     # Close connections
