@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.widgets import RectangleSelector
 from datetime import timedelta, datetime
 import json, os
+
 
 
 class PlotManager:
@@ -15,6 +17,7 @@ class PlotManager:
         self.ax = None
         self.canvas = None
         self.selector = None
+        self.tooltip_enabled = True  # default ON
 
         # Data store
         self.current_df = pd.DataFrame()
@@ -28,8 +31,7 @@ class PlotManager:
 
         # X time caches (for quick search)
         self._x_pd = None                    # pandas datetime Series (tz-naive)
-        self._x_np = None                    # numpy datetime64[ns] array (sorted)
-        self._x_nums = None                  # matplotlib float date numbers (optional)
+        self._x_np = None                    # numpy datetime64[ns] array (sorted)                 # matplotlib float date numbers (optional)
         self._ds_idx = None                  # downsample indices for plotting
 
         # Store "home view"
@@ -45,6 +47,20 @@ class PlotManager:
 
         # Perf knobs
         self.max_points = int(max_points)    # hard cap on points per line
+
+    def show_message(self, msg: str, color="red"):
+        """Display a centered message on the plot instead of data."""
+        if self.fig is None or self.ax is None or self.canvas is None:
+            self.init_plot()
+        self.ax.clear()
+        self.ax.text(
+            0.5, 0.5, msg,
+            ha="center", va="center", transform=self.ax.transAxes,
+            fontsize=14, color=color, wrap=True
+        )
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        self.canvas.draw_idle()
 
     # -------------------------------
     # Init plot
@@ -67,6 +83,9 @@ class PlotManager:
         self.fig.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.fig.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.fig.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.fig.canvas.mpl_connect("axes_enter_event", self._on_axes_enter)
+        self.fig.canvas.mpl_connect("figure_leave_event", self._on_figure_leave)
+
 
         # Minor perf tweaks
         try:
@@ -79,20 +98,24 @@ class PlotManager:
 
         # Date formatting
         locator = mdates.AutoDateLocator(minticks=5, maxticks=12)
-        formatter = mdates.DateFormatter("%Y-%m-%d\n%H:%M:%S")
+        formatter = mdates.DateFormatter("%m/%d")
+
         self.ax.xaxis.set_major_locator(locator)
         self.ax.xaxis.set_major_formatter(formatter)
         self.fig.autofmt_xdate(rotation=0, ha="center")
+
+    def _on_axes_enter(self, event):
+        # restore normal tooltip mode
+        self._tooltip_mode = "cursor"
 
     # -------------------------------
     # Plot data (fast)
     # -------------------------------
     def plot_data(self, df, selected_columns, fresh=False, color_map=None):
-        """If fresh=True, rebuild lines from new df.
-           If fresh=False, just toggle visibility according to selected_columns.
-        """
         if df is None:
             return
+        # 👇 Break time gaps so lines don’t connect
+        df = self._break_time_gaps(df, threshold="1D")  # threshold = 1 day (tune this)
 
         # Ensure plot exists
         if self.fig is None or self.ax is None or self.canvas is None:
@@ -234,23 +257,37 @@ class PlotManager:
             self._on_mouse_move(event)
 
     def _on_mouse_move(self, event):
+        if not self.tooltip_enabled:
+            return
+        if getattr(self, "_tooltip_mode", "cursor") == "legend":
+            return  # don’t draw cursor tooltips if docked
         if event.inaxes != self.ax or event.xdata is None or self.current_df.empty:
             return
 
         # Fast nearest: binary search in sorted _x_np
         try:
+            if len(self._x_np) == 0:
+                return
+
             mouse_dt_py = mdates.num2date(event.xdata).replace(tzinfo=None)
             mouse_ns = np.datetime64(mouse_dt_py, "ns")
-            idx = int(np.searchsorted(self._x_np, mouse_ns))
-            if idx <= 0:
-                nearest = 0
-            elif idx >= len(self._x_np):
-                nearest = len(self._x_np) - 1
+
+            if mouse_ns < self._x_np[0] or mouse_ns > self._x_np[-1]:
+                # Outside data range → fabricate a "zero row"
+                row = {col: 0 for col in self.current_columns}
+                row["updated_at"] = mouse_dt_py
             else:
-                prev_diff = abs(self._x_np[idx - 1] - mouse_ns)
-                next_diff = abs(self._x_np[idx] - mouse_ns)
-                nearest = idx - 1 if prev_diff <= next_diff else idx
-            row = self.current_df.iloc[nearest]
+                # Normal nearest neighbor logic
+                idx = int(np.searchsorted(self._x_np, mouse_ns))
+                if idx <= 0:
+                    nearest = 0
+                elif idx >= len(self._x_np):
+                    nearest = len(self._x_np) - 1
+                else:
+                    prev_diff = abs(self._x_np[idx - 1] - mouse_ns)
+                    next_diff = abs(self._x_np[idx] - mouse_ns)
+                    nearest = idx - 1 if prev_diff <= next_diff else idx
+                row = self.current_df.iloc[nearest]
         except Exception:
             return
 
@@ -355,6 +392,27 @@ class PlotManager:
         if event.button == 3:
             self._is_panning = False
 
+    def _on_figure_leave(self, event):
+        # Clear tooltip items
+        if hasattr(self, "_tooltip_items"):
+            for item in self._tooltip_items:
+                try:
+                    item.remove()
+                except Exception:
+                    pass
+            self._tooltip_items = []
+
+        # Remove crosshair if present
+        if self.vline is not None:
+            try:
+                self.vline.remove()
+            except Exception:
+                pass
+            self.vline = None
+
+        if self.canvas:
+            self.canvas.draw_idle()
+
     def _on_mouse_drag(self, event):
         if not getattr(self, "_is_panning", False) or event.inaxes != self.ax:
             return
@@ -374,8 +432,16 @@ class PlotManager:
     def _on_select(self, eclick, erelease):
         if eclick.xdata is None or erelease.xdata is None:
             return
-        self.ax.set_xlim(min(eclick.xdata, erelease.xdata), max(eclick.xdata, erelease.xdata))
-        self.ax.set_ylim(min(eclick.ydata, erelease.ydata), max(eclick.ydata, erelease.ydata))
+
+        x0, x1 = eclick.xdata, erelease.xdata
+        y0, y1 = eclick.ydata, erelease.ydata
+
+        # Only zoom if there’s actually a nonzero span
+        if x0 != x1:
+            self.ax.set_xlim(min(x0, x1), max(x0, x1))
+        if y0 != y1:
+            self.ax.set_ylim(min(y0, y1), max(y0, y1))
+
         self.canvas.draw_idle()
         if self.on_select_hook:
             self.on_select_hook(eclick, erelease)
@@ -393,14 +459,36 @@ class PlotManager:
         self.canvas.draw_idle()
 
     def _on_key(self, event):
-        if event.key in ["escape", "r"]:
+        key = event.key.lower() if event.key else ""
+
+        # Tooltip toggle
+        if key == "t":
+            self.tooltip_enabled = not self.tooltip_enabled
+            print(f"[PlotManager] Tooltip {'enabled' if self.tooltip_enabled else 'disabled'}")
+
+            if not self.tooltip_enabled:
+                if hasattr(self, "_tooltip_items"):
+                    for item in self._tooltip_items:
+                        try:
+                            item.remove()
+                        except Exception:
+                            pass
+                    self._tooltip_items = []
+                if self.vline is not None:
+                    self.vline.remove()
+                    self.vline = None
+                self.canvas.draw_idle()
+            return
+
+        # Reset view
+        if key in ["escape", "r"]:
             self.reset_view()
             return
 
+        # Arrow keys navigation
         xlim = self.ax.get_xlim()
         x0, x1 = mdates.num2date(xlim[0]), mdates.num2date(xlim[1])
         delta = timedelta(minutes=1)
-        key = event.key.lower()
         if key.startswith("shift"):
             delta = timedelta(hours=1)
         if key.startswith("ctrl"):
@@ -410,6 +498,7 @@ class PlotManager:
             self.ax.set_xlim(x0 - delta, x1 - delta)
         elif key.endswith("right"):
             self.ax.set_xlim(x0 + delta, x1 + delta)
+
         self.canvas.draw_idle()
 
         if self.on_key_hook:
@@ -419,11 +508,30 @@ class PlotManager:
     # Reset view
     # -------------------------------
     def reset_view(self):
-        if self.home_xlim:
-            self.ax.set_xlim(self.home_xlim)
+        """Reset plot to show the full extent of the currently loaded dataset."""
+        if self.current_df is None or self.current_df.empty:
+            print("[PlotManager] No data loaded, cannot reset view.")
+            return
+
+        try:
+            start = self.current_df["updated_at"].min()
+            end = self.current_df["updated_at"].max()
+            if start is None or end is None:
+                print("[PlotManager] No valid updated_at values.")
+                return
+
+            # Reset x-limits
+            self.ax.set_xlim(start, end)
+            self.home_xlim = self.ax.get_xlim()
+
+            # Rescale y based on visible data
             self.ax.relim(visible_only=True)
-            self.ax.autoscale(axis="y")
+            self.ax.autoscale(axis="y", tight=False)
+
             self.canvas.draw_idle()
+            print(f"[PlotManager] 🔄 Reset view to full range: {start} → {end}")
+        except Exception as e:
+            print(f"[PlotManager] ❌ Reset view failed: {e}")
 
     def set_time_window(self, start_la: datetime, end_la: datetime):
         """Force the x-axis to the exact LA-naive datetime window (matches UI inputs)."""
@@ -440,22 +548,92 @@ class PlotManager:
     # -------------------------------
     # Cache
     # -------------------------------
+    # in PlotManager._save_cache
+    def _break_time_gaps(self, df, threshold="1D"):
+        """
+        Insert NaN rows wherever time gaps exceed the threshold.
+        Ensures matplotlib does not connect lines across missing data.
+        """
+        if df.empty or "updated_at" not in df.columns:
+            return df
+
+        df = df.sort_values("updated_at").copy()
+        gap_threshold = pd.Timedelta(threshold)
+
+        # Find indices where the gap is larger than threshold
+        gaps = df["updated_at"].diff() > gap_threshold
+        rows_to_insert = []
+
+        for i in df[gaps].index:
+            ts = df.loc[i, "updated_at"]
+
+            # Build a dict of correct dtypes → NaN or NaT
+            nan_row = {}
+            for col in df.columns:
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    nan_row[col] = pd.NaT
+                elif pd.api.types.is_numeric_dtype(df[col]):
+                    nan_row[col] = np.nan
+                else:
+                    nan_row[col] = None
+            nan_row["updated_at"] = ts - pd.Timedelta(seconds=1)
+
+            rows_to_insert.append(nan_row)
+
+        if rows_to_insert:
+            filler = pd.DataFrame(rows_to_insert).astype(df.dtypes.to_dict(), errors="ignore")
+            df = pd.concat([df, filler], ignore_index=True)
+            df = df.sort_values("updated_at")
+
+        return df
+
     def _save_cache(self, df, selected_columns, col_states=None):
         try:
-            cols = [c for c in (selected_columns or []) if c in df.columns]
-            cols = list(dict.fromkeys(cols + ["updated_at"]))  # unique + keep order
-            df[cols].to_parquet(self.cache_file)
+            cols = list(df.columns)
+            if "updated_at" not in cols:
+                cols.append("updated_at")
+
+            # compute time_range for meta
+            if "updated_at" in df.columns and not df.empty:
+                earliest = pd.to_datetime(df["updated_at"]).min()
+                latest = pd.to_datetime(df["updated_at"]).max()
+                # serialize as ISO for stable signatures
+                earliest_iso = earliest.isoformat()
+                latest_iso = latest.isoformat()
+            else:
+                earliest_iso = latest_iso = None
+
+            try:
+                df[cols].to_parquet(self.cache_file, index=False)
+                fmt = "parquet"
+            except (ImportError, ValueError) as e:
+                import os
+                alt_file = os.path.splitext(self.cache_file)[0] + ".csv"
+                df[cols].to_csv(alt_file, index=False)
+                self.cache_file = alt_file
+                fmt = "csv"
+                print(f"[Cache] Falling back to CSV: {e}")
+
+            # safe x/y lim capture
+            xlim = list(self.ax.get_xlim()) if self.ax else None
+            ylim = list(self.ax.get_ylim()) if self.ax else None
+
             meta = {
                 "columns": selected_columns or [],
                 "col_states": col_states or {},
-                "xlim": list(self.ax.get_xlim()),
-                "ylim": list(self.ax.get_ylim()),
-                "version": 1
+                "xlim": xlim,
+                "ylim": ylim,
+                "version": 1,
+                "format": fmt,
+                "time_range": {"earliest": earliest_iso, "latest": latest_iso},
             }
             with open(self.meta_file, "w") as f:
                 json.dump(meta, f)
+
+            return True
         except Exception as e:
             print(f"[Cache] Failed to save: {e}")
+            return False
 
     def load_cache(self):
         if os.path.exists(self.cache_file) and os.path.exists(self.meta_file):
@@ -472,8 +650,9 @@ class PlotManager:
                 if xlim: self.ax.set_xlim(xlim)
                 if ylim: self.ax.set_ylim(ylim)
                 self.canvas.draw_idle()
-
-                return df, columns, col_states
+                df = pd.read_parquet(self.cache_file) if self.cache_file.endswith(".parquet") else pd.read_csv(
+                    self.cache_file)
+                return df, meta.get("columns", []), meta.get("col_states", {}), meta.get("time_range")
             except Exception as e:
                 print(f"[Cache] Failed to load: {e}")
         return None, [], {}

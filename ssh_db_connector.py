@@ -19,7 +19,6 @@ class SSHForwardServer(threading.Thread):
         self.running = False
 
     def run(self):
-        print("[DEBUG] ForwardServer thread started")
         try:
             self.sock = s.socket(s.AF_INET, s.SOCK_STREAM)
             self.sock.setsockopt(s.SOL_SOCKET, s.SO_REUSEADDR, 1)
@@ -29,9 +28,7 @@ class SSHForwardServer(threading.Thread):
             while self.running:
                 try:
                     client_sock, addr = self.sock.accept()
-                    print(f"[DEBUG] ForwardServer accepted connection from {addr}")
                 except OSError:
-                    print("[DEBUG] ForwardServer socket closed, exiting run()")
                     break
 
                 try:
@@ -84,7 +81,6 @@ class SSHForwardServer(threading.Thread):
         finally:
             client_sock.close()
             chan.close()
-
 
 class SSHDatabaseConnector:
     def __init__(self):
@@ -164,7 +160,7 @@ class SSHDatabaseConnector:
         )
         self.engine = create_engine(db_url)
 
-        print("[DEBUG] SSH tunnel established, SQLAlchemy engine ready")
+
         return self.engine
 
     def disconnect(self):
