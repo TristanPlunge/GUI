@@ -3,6 +3,7 @@ import customtkinter as ctk
 from tkinter import Toplevel, messagebox
 import threading
 import pandas as pd
+import config_manager
 from sqlalchemy import text
 
 
@@ -17,6 +18,7 @@ class UserSearchWindow:
         self.top.title("User Search")
         self.top.transient(app.root)
         self.top.grab_set()
+        self.top.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Center popup
         self.top.update_idletasks()
@@ -34,15 +36,17 @@ class UserSearchWindow:
         control_frame.pack(fill="x", padx=10, pady=5)
 
         ctk.CTkLabel(control_frame, text="Search by:", text_color="black").pack(side="left", padx=5)
-        self.search_mode = ctk.StringVar(value="full_name")
+        saved_mode = self.app.config.get("search_mode", "full_name")
+        self.search_mode = ctk.StringVar(value=saved_mode)
+
         self.mode_menu = ctk.CTkComboBox(
             control_frame,
             variable=self.search_mode,
-            values=["full_name", "user_id"],
+            values=["full_name", "user_id", "email"],
             width=150
         )
         self.mode_menu.pack(side="left", padx=5)
-
+        self.search_mode.trace_add("write", self._on_mode_change)
         self.entry = ctk.CTkEntry(control_frame, placeholder_text="Type a name or ID…", width=250)
         self.entry.pack(side="left", padx=5)
         self.entry.bind("<Return>", lambda e: self.run_search())
@@ -65,21 +69,55 @@ class UserSearchWindow:
         # Store df from search
         self.search_results = pd.DataFrame()
 
+    def _on_close(self):
+        try:
+            # update parent config with latest dropdown selection
+            self.app.config["search_mode"] = self.search_mode.get()
+            config_manager.save_config(self.app.config)
+        except Exception as e:
+            self.logger(f"[UserSearch] Failed to save search_mode: {e}")
+        finally:
+            self.top.destroy()
+
+    def _on_mode_change(self, *args):
+        try:
+            self.app.config["search_mode"] = self.search_mode.get()
+            # If you want to save right away:
+            if hasattr(self.app, "_save_config_now"):
+                self.app._save_config_now()
+            self.logger(f"[UserSearch] Updated search_mode={self.search_mode.get()}")
+        except Exception as e:
+            self.logger(f"[UserSearch] Failed to update search_mode: {e}")
+
     # -------------------------------
     # Query logic
     # -------------------------------
     def _search_db(self, field: str, pattern: str, limit: int = 100) -> pd.DataFrame:
         if not self.query_manager.connect():
             return pd.DataFrame()
+        if field == "email":
+            sql = text(f"""
+                SELECT DISTINCT 
+                    ucd.esp_ble_id, up.user_id, up.full_name
+                FROM cpdevdb.user_cp_devices AS ucd
+                JOIN cpdevdb.user_profile AS up 
+                    ON ucd.user_id = up.user_id
+                JOIN cpdevdb.user AS u
+                    ON up.user_id = u.user_id
+                WHERE u.email LIKE :pattern
+                LIMIT {limit};
 
-        sql = text(f"""
-            SELECT DISTINCT up.user_id, up.full_name, ucd.esp_ble_id
-            FROM cpdevdb.user_cp_devices AS ucd
-            JOIN cpdevdb.user_profile AS up
-              ON ucd.user_id = up.user_id
-            WHERE up.{field} LIKE :pattern
-            LIMIT {limit};
-        """)
+            """)
+        else:
+            sql = text(f"""
+                SELECT DISTINCT up.user_id, up.full_name, ucd.esp_ble_id
+                FROM cpdevdb.user_cp_devices AS ucd
+                JOIN cpdevdb.user_profile AS up
+                  ON ucd.user_id = up.user_id
+                WHERE up.{field} LIKE :pattern
+                LIMIT {limit};
+            """)
+
         params = {"pattern": f"%{pattern}%"}  # substring search
 
         with self.query_manager.engine.connect() as conn:
@@ -110,7 +148,7 @@ class UserSearchWindow:
 
             # normalize NaN/null esp_ble_id
             if "esp_ble_id" in df.columns:
-                df["esp_ble_id"] = df["esp_ble_id"].fillna("No device")
+                df["esp_ble_id"] = df["esp_ble_id"].fillna("Device not connected")
 
             self.search_results = df
             self.top.after(0, lambda: self._update_user_list(df, query_text, field))
@@ -133,14 +171,16 @@ class UserSearchWindow:
         for _, row in subset.iterrows():
             esp = row["esp_ble_id"]
 
-            if esp == "No device":  # 🛑 just a label, not clickable
+            if esp == "Device not connected":
+                # Show a gray, non-clickable label
                 ctk.CTkLabel(
                     self.device_listbox,
-                    text="No device",
+                    text="Device not connected",
                     anchor="w",
                     text_color="gray"
                 ).pack(fill="x", padx=5, pady=2)
-            else:  # ✅ normal clickable button
+            else:
+                # Show normal clickable button
                 btn = ctk.CTkButton(
                     self.device_listbox,
                     text=esp,
@@ -160,12 +200,27 @@ class UserSearchWindow:
             widget.destroy()
 
         if df.empty:
-            ctk.CTkLabel(self.user_listbox, text=f"No results for {field} like '{query_text}'").pack(anchor="w", padx=5, pady=5)
+            ctk.CTkLabel(self.user_listbox, text=f"No results for {field} like '{query_text}'").pack(anchor="w", padx=5,
+                                                                                                     pady=5)
             return
 
-        # Get unique users
-        unique_users = df.groupby(["user_id", "full_name"]).size().reset_index().drop(columns=0)
+        # Ensure unique users
+        unique_users = df.drop_duplicates(subset=["user_id", "full_name"]).copy()
+        if not unique_users.empty:
+            # Normalize capitalization
+            unique_users["full_name"] = unique_users["full_name"].str.title()
 
+            # Split into first/last for sorting
+            unique_users[["first_name", "last_name"]] = unique_users["full_name"].str.split(" ", n=1, expand=True)
+            # Sort case-insensitive
+            unique_users = unique_users.sort_values(
+                by=["first_name", "last_name"],
+                key=lambda col: col.str.lower()
+            )
+            # Drop helpers
+            unique_users = unique_users.drop(columns=["first_name", "last_name"])
+
+        # Populate UI
         for _, row in unique_users.iterrows():
             uid = row["user_id"]
             name = row["full_name"]
@@ -200,7 +255,8 @@ class UserSearchWindow:
             btn.pack(fill="x", padx=5, pady=2)
 
     def _select_esp_ble_id(self, esp_id):
-        if esp_id == "No device":
+        if esp_id in ("No device", "Device not connected"):
+            # do nothing if it's a placeholder
             return
         """When an esp_ble_id is clicked, push it into the parent filter and close search."""
         try:

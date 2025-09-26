@@ -488,6 +488,7 @@ class MetricsApp:
             cfg = {
                 "filter_type": self.filter_type.get(),
                 "filter_value": self.filter_value.get(),
+                "search_mode": self.config.get("search_mode", "full_name"),
                 "start_date": start_str,
                 "end_date": end_str,
                 "columns": self.get_selected_table_columns(),
