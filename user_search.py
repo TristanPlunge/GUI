@@ -12,7 +12,7 @@ class UserSearchWindow:
         self.app = app                # MetricsApp instance
         self.query_manager = query_manager
         self.logger = logger
-
+        self.selected_user_btn = None   # track currently selected user button
         # build window
         self.top = Toplevel(app.root)
         self.top.title("User Search")
@@ -98,22 +98,32 @@ class UserSearchWindow:
         if field == "email":
             sql = text(f"""
                 SELECT DISTINCT 
-                    ucd.esp_ble_id, up.user_id, up.full_name
+                    ucd.esp_ble_id, 
+                    up.user_id, 
+                    up.full_name, 
+                    ud.device_nickname
                 FROM cpdevdb.user_cp_devices AS ucd
                 JOIN cpdevdb.user_profile AS up 
                     ON ucd.user_id = up.user_id
                 JOIN cpdevdb.user AS u
                     ON up.user_id = u.user_id
+                LEFT JOIN cpdevdb.user_device AS ud
+                    ON ucd.user_id = ud.user_id
                 WHERE u.email LIKE :pattern
                 LIMIT {limit};
-
             """)
         else:
             sql = text(f"""
-                SELECT DISTINCT up.user_id, up.full_name, ucd.esp_ble_id
-                FROM cpdevdb.user_cp_devices AS ucd
-                JOIN cpdevdb.user_profile AS up
-                  ON ucd.user_id = up.user_id
+                SELECT DISTINCT 
+                    up.user_id, 
+                    up.full_name, 
+                    ucd.esp_ble_id, 
+                    ud.device_nickname
+                FROM cpdevdb.user_profile AS up
+                LEFT JOIN cpdevdb.user_cp_devices AS ucd
+                    ON ucd.user_id = up.user_id
+                LEFT JOIN cpdevdb.user_device AS ud
+                    ON ucd.user_id = ud.user_id
                 WHERE up.{field} LIKE :pattern
                 LIMIT {limit};
             """)
@@ -156,39 +166,6 @@ class UserSearchWindow:
             self.logger(f"[UserSearch] error: {e}")
             self.top.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
 
-    def _show_devices_for_user(self, user_id):
-        # Clear device list
-        for widget in self.device_listbox.winfo_children():
-            widget.destroy()
-
-        df = self.search_results
-        subset = df[df["user_id"] == user_id]
-
-        if subset.empty:
-            ctk.CTkLabel(self.device_listbox, text="No devices for this user.").pack(anchor="w", padx=5, pady=5)
-            return
-
-        for _, row in subset.iterrows():
-            esp = row["esp_ble_id"]
-
-            if esp == "Device not connected":
-                # Show a gray, non-clickable label
-                ctk.CTkLabel(
-                    self.device_listbox,
-                    text="Device not connected",
-                    anchor="w",
-                    text_color="gray"
-                ).pack(fill="x", padx=5, pady=2)
-            else:
-                # Show normal clickable button
-                btn = ctk.CTkButton(
-                    self.device_listbox,
-                    text=esp,
-                    anchor="w",
-                    command=lambda esp_id=esp: self._select_esp_ble_id(esp_id)
-                )
-                btn.pack(fill="x", padx=5, pady=2)
-
     # -------------------------------
     # UI population
     # -------------------------------
@@ -200,37 +177,42 @@ class UserSearchWindow:
             widget.destroy()
 
         if df.empty:
-            ctk.CTkLabel(self.user_listbox, text=f"No results for {field} like '{query_text}'").pack(anchor="w", padx=5,
-                                                                                                     pady=5)
+            ctk.CTkLabel(
+                self.user_listbox,
+                text=f"No results for {field} like '{query_text}'"
+            ).pack(anchor="w", padx=5, pady=5)
             return
 
-        # Ensure unique users
         unique_users = df.drop_duplicates(subset=["user_id", "full_name"]).copy()
         if not unique_users.empty:
-            # Normalize capitalization
             unique_users["full_name"] = unique_users["full_name"].str.title()
-
-            # Split into first/last for sorting
             unique_users[["first_name", "last_name"]] = unique_users["full_name"].str.split(" ", n=1, expand=True)
-            # Sort case-insensitive
             unique_users = unique_users.sort_values(
                 by=["first_name", "last_name"],
                 key=lambda col: col.str.lower()
-            )
-            # Drop helpers
-            unique_users = unique_users.drop(columns=["first_name", "last_name"])
+            ).drop(columns=["first_name", "last_name"])
 
         # Populate UI
         for _, row in unique_users.iterrows():
             uid = row["user_id"]
             name = row["full_name"]
+
             btn = ctk.CTkButton(
                 self.user_listbox,
                 text=f"{name} (ID={uid})",
-                anchor="w",
-                command=lambda u=uid: self._show_devices_for_user(u)
+                anchor="w"
             )
+            # ✅ set command AFTER button creation to avoid UnboundLocalError
+            btn.configure(command=lambda u=uid, b=btn: self._on_user_click(u, b))
             btn.pack(fill="x", padx=5, pady=2)
+
+    def _on_user_click(self, user_id, btn):
+        if self.selected_user_btn is not None and self.selected_user_btn.winfo_exists():
+            self.selected_user_btn.configure(text_color="white")
+
+        btn.configure(text_color="yellow")  # highlight
+        self.selected_user_btn = btn
+        self._show_devices_for_user(user_id)
 
     def _show_devices_for_user(self, user_id):
         # Clear device list
@@ -241,18 +223,58 @@ class UserSearchWindow:
         subset = df[df["user_id"] == user_id]
 
         if subset.empty:
-            ctk.CTkLabel(self.device_listbox, text="No devices for this user.").pack(anchor="w", padx=5, pady=5)
+            ctk.CTkLabel(
+                self.device_listbox,
+                text="No devices for this user."
+            ).pack(anchor="w", padx=5, pady=5)
             return
 
+        # ✅ Extract the user’s name from the subset
+        user_name = subset["full_name"].iloc[0] if "full_name" in subset.columns else "Unknown"
+
+        # ✅ Add a header label for user
+        header_label = ctk.CTkLabel(
+            self.device_listbox,
+            text=f"{user_name} (ID={user_id})",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=("black", "white"),  # black in light mode, white in dark mode
+            fg_color=("#E0E0E0", "#333333"),  # light gray (light mode) / dark gray (dark mode)
+            corner_radius=6,
+            anchor="center",
+            justify="center",
+            width=280,
+            height=40
+        )
+        header_label.pack(pady=(0, 10), padx=5)
+
+        # Populate device buttons
         for _, row in subset.iterrows():
             esp = row["esp_ble_id"]
-            btn = ctk.CTkButton(
-                self.device_listbox,
-                text=esp,
-                anchor="w",
-                command=lambda esp_id=esp: self._select_esp_ble_id(esp_id)
-            )
-            btn.pack(fill="x", padx=5, pady=2)
+            nickname = row.get("device_nickname")
+
+            if esp == "Device not connected":
+                btn = ctk.CTkButton(
+                    self.device_listbox,
+                    text="Device not connected",
+                    anchor="w",
+                    state="disabled",
+                    text_color="gray"
+                )
+                btn.pack(fill="x", padx=5, pady=2)
+            else:
+                label_text = esp
+                if nickname and pd.notna(nickname):
+                    label_text = f"{esp} ({nickname})"
+                else:
+                    label_text = f"{esp} (No name)"
+
+                btn = ctk.CTkButton(
+                    self.device_listbox,
+                    text=label_text,
+                    anchor="w",
+                    command=lambda esp_id=esp: self._select_esp_ble_id(esp_id)
+                )
+                btn.pack(fill="x", padx=5, pady=2)
 
     def _select_esp_ble_id(self, esp_id):
         if esp_id in ("No device", "Device not connected"):

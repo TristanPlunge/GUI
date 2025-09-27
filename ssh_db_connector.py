@@ -121,7 +121,6 @@ class SSHDatabaseConnector:
             missing = [k for k in required if not self.params.get(k)]
             if missing:
                 raise RuntimeError(f"Missing required fields after editor: {', '.join(missing)}")
-
         # --- SSH client setup ---
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -158,7 +157,15 @@ class SSHDatabaseConnector:
             f"mysql+mysqldb://{self.params['MYSQL_USER']}:{self.params['MYSQL_PASSWORD']}"
             f"@127.0.0.1:{self.local_port}/{self.params['MYSQL_DB']}"
         )
-        self.engine = create_engine(db_url)
+
+
+        self.engine = create_engine(
+            db_url,
+            pool_size=5,  # keep 5 connections ready
+            max_overflow=10,  # allow 10 extra if needed
+            pool_recycle=1800,  # recycle every 30 min to avoid "server has gone away"
+            pool_pre_ping=True,  # validate connection before using it
+        )
 
 
         return self.engine

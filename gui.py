@@ -2,6 +2,7 @@ import customtkinter as ctk
 from tkinter import messagebox
 import threading
 import time
+import json
 from datetime import datetime, timedelta
 from dateutil import parser
 from widgets import CollapsibleSection
@@ -12,7 +13,7 @@ import pandas as pd
 import os
 import numpy as np
 from user_search import UserSearchWindow
-
+from tkinter import filedialog, messagebox
 
 class MetricsApp:
     def __init__(self):
@@ -47,15 +48,16 @@ class MetricsApp:
         # Master color map
         self.color_map = {
             "fan_tach_rpm": "#1E90FF",
-            "coolant_temp_f": "#FF4500",
+            "coolant_temp_f": "#ADFF2F",
             "ebox_temp_f": "#FFD700",
             "water_temp_f": "#00CED1",
-            "target_temp_f": "#ADFF2F",
+            "target_temp_f": "#FF4500",
             "flow_sense_lpm": "#00FF7F",
             "pump_current_amp": "#FF69B4",
             "compressor_current_amp": "#FFA500",
         }
-
+        self.current_time_range = "None"  # (earliest, latest) or list of (s,e) tuples
+        self.current_user_id = "None"
         # Root window
         self.root = ctk.CTk()
         self.root.withdraw()
@@ -75,11 +77,14 @@ class MetricsApp:
         file_menu.add_command(label="Search", command=self.open_search_window)
         file_menu.add_separator()
         self.root.bind("s", lambda e: self.open_search_window())
+        file_menu.add_command(label="Save CSV", command=self.save_to_csv)
+        file_menu.add_separator()
+        self.root.bind("s", lambda e: self.save_to_csv())
         file_menu.add_command(label="Exit", command=self.on_close)
 
         # bind key S (with no modifiers)
         self.root.bind("s", lambda e: self.open_search_window())
-
+        self.root.bind("<Control-s>", lambda e: self.save_to_csv())
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.config(menu=menubar)
         # Build UI
@@ -144,6 +149,32 @@ class MetricsApp:
             target=self.query_manager.warm_up, daemon=True
         ).start())
 
+    def save_to_csv(self):
+        if self.df is None or self.df.empty:
+            messagebox.showwarning("Save CSV", "No data available to save.")
+            return
+
+        # Ask user where to save
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save data as CSV"
+        )
+        if not file_path:
+            return  # user cancelled
+
+        try:
+            # Only save currently visible columns (based on checkbox states)
+            selected_cols = self.get_selected_table_columns()
+            export_df = self.df[selected_cols] if selected_cols else self.df
+
+            export_df.to_csv(file_path, index=False)
+            self.log(f"✅ Data saved to {file_path}")
+            messagebox.showinfo("Save CSV", f"Data saved successfully:\n{file_path}")
+        except Exception as e:
+            self.log(f"❌ Save CSV failed: {e}")
+            messagebox.showerror("Save CSV", f"Failed to save: {e}")
+
     def open_search_window(self):
         UserSearchWindow(self, self.query_manager, logger=self.log)
 
@@ -165,6 +196,7 @@ class MetricsApp:
             cols = tuple(meta.get("columns", []))
             return ("meta", tr.get("earliest"), tr.get("latest"), cols)
         except Exception:
+            print("Failed at line 169 in gui.py")
             return None
 
     def _cancel_all_afters_shutdown(self):
@@ -570,6 +602,12 @@ class MetricsApp:
         )
         self.cache_btn.pack(side="left", padx=10)
 
+        self.ranges_btn = ctk.CTkButton(
+            self.run_frame, text="📅 Ranges",
+            command=self.on_show_ranges, fg_color="#9b59b6", hover_color="#6c3483"
+        )
+        self.ranges_btn.pack(side="left", padx=10)
+
         # Disable if no cache exists
         if not (os.path.exists(self.plot_manager.cache_file) and os.path.exists(self.plot_manager.meta_file)):
             self.cache_btn.configure(state="disabled")
@@ -581,6 +619,50 @@ class MetricsApp:
         # 📊 Status label (device, user, min/max time range)
         self.status_label = ctk.CTkLabel(self.run_frame, text="No query run yet")
         self.status_label.pack(side="left", padx=10)
+
+    def on_show_ranges(self):
+        if self.query_running:
+            self._show_warning_popup("Another query is running, please wait.")
+            return
+
+        self.query_running = True
+        self.start_timer()
+
+        def worker():
+            try:
+                filter_type = self.filter_type.get()
+                filter_value = self.filter_value.get().strip()
+
+                if not filter_value:
+                    self.safe_after(0, messagebox.showerror, "Error", "Filter Value cannot be empty.")
+                    return
+
+                ranges = self.query_manager.get_date_ranges(filter_type, filter_value)
+                if not ranges:
+                    self.safe_after(0, self.log, "⚠️ No data ranges found.")
+                    self.safe_after(0, self._show_warning_popup, "⚠️ No data ranges found.")
+                    return
+
+                formatted = [
+                    f"{s:%m/%d}–{e:%m/%d}" if s != e else f"{s:%m/%d}"
+                    for s, e in ranges
+                ]
+
+                output = ", ".join(formatted)
+                self.current_time_range = output
+                # ✅ Update both log and status label
+                self.safe_after(0, self.log, f"📅 Data ranges: {output}")
+                self.safe_after(0, self.update_status_text)
+
+
+            except Exception as e:
+                self.safe_after(0, self.log, f"❌ Ranges error: {e}")
+                self.safe_after(0, messagebox.showerror, "Error", str(e))
+            finally:
+                self.safe_after(0, self.stop_timer)
+                self.safe_after(0, lambda: setattr(self, "query_running", False))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_load_cache(self):
         try:
@@ -1297,9 +1379,30 @@ class MetricsApp:
     # -------------------------------
     # Events
     # -------------------------------
+    def _show_warning_popup(self, message):
+        if hasattr(self, "_warn_popup") and self._warn_popup.winfo_exists():
+            return  # already showing
+
+        self._warn_popup = ctk.CTkToplevel(self.root)
+        self._warn_popup.title("Warning")
+        self._warn_popup.geometry("320x120")
+        self._warn_popup.transient(self.root)
+        self._warn_popup.grab_set()  # optional: focus on popup
+
+        lbl = ctk.CTkLabel(self._warn_popup, text=message, text_color="orange", wraplength=280)
+        lbl.pack(pady=15)
+
+        # Add dismiss button (optional)
+        btn = ctk.CTkButton(self._warn_popup, text="OK", command=self._warn_popup.destroy)
+        btn.pack(pady=5)
+
+    def _close_warning_popup(self):
+        if hasattr(self, "_warn_popup") and self._warn_popup.winfo_exists():
+            self._warn_popup.destroy()
+
     def on_run(self):
         if self.query_running:
-            self.log("Query already in progress, please wait...")
+            self._show_warning_popup("A query is already running. Please wait until it finishes.")
             return
 
         if not self.filter_value.get().strip():
@@ -1346,7 +1449,6 @@ class MetricsApp:
                 filter_value=self.filter_value.get(),
                 start_date_str=start.strftime("%Y-%m-%d"),
                 end_date_str=end.strftime("%Y-%m-%d"),
-                selected_columns=sel_cols
             )
 
             if df_new.empty:
@@ -1387,6 +1489,7 @@ class MetricsApp:
             self.safe_after(0, self.stop_timer)
             self.safe_after(0, lambda: self.run_btn.configure(state="normal"))
             self.safe_after(0, lambda: setattr(self, "query_running", False))
+            self.safe_after(0, self._close_warning_popup)  # 🔥 close warning popup
 
     def _render_first_time(self, df):
         self.build_column_checkboxes(df.columns, getattr(self, "_saved_col_states", None))
@@ -1411,20 +1514,28 @@ class MetricsApp:
                 self.plot_manager.set_time_window(s, e)
 
     def _save_cache_ui(self, df):
-        cols = self.get_selected_table_columns() or list(self.df.columns)
-        col_states = {col: self.col_vars.get(col).get() if col in self.col_vars else True for col in cols}
-        ok = self.plot_manager._save_cache(self.df, cols, col_states)
+        if df is None or df.empty:
+            self.log("⚠️ No data to cache.")
+            return False
+
+        # Build col_states across all columns
+        col_states = {col: (self.col_vars[col].get() if col in self.col_vars else True)
+                      for col in df.columns}
+
+        ok = self.plot_manager._save_cache(df, list(df.columns), col_states)
         if ok:
-            self._last_cache_signature = self._cache_signature(df)  # ← keep latest signature
-            self.log(f"Cache saved with {len(cols)} columns")
+            self._last_cache_signature = self._cache_signature(df)
+            self.log(f"💾 Cache saved with {sum(col_states.values())} selected columns")
         else:
             self.log("❌ Cache save failed (no columns or write error).")
+        return ok
 
     def _update_status_labels(self, df, time_range=None):
         if df.empty:
             return
         device_val = df["device_name"].dropna().iloc[0] if "device_name" in df else self.filter_value.get()
         user_val = df["user_id"].dropna().iloc[0] if "user_id" in df else "?"
+        self.current_user_id = user_val
 
         if time_range:
             earliest = time_range.get("earliest")
@@ -1437,8 +1548,11 @@ class MetricsApp:
             earliest, latest = getattr(self.query_manager, "timestamp_range", (None, None))
             ts_range = f"{earliest:%Y-%m-%d} → {latest:%Y-%m-%d}" if earliest and latest else "N/A"
 
+        self.update_status_text()
+
+    def update_status_text(self):
         self.status_label.configure(
-            text=f"User: {user_val} | Min/Max Time range: {ts_range}"
+            text=f"User: {self.current_user_id} | Data Time Range: {self.current_time_range}"
         )
 
     def on_column_change(self):

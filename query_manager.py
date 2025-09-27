@@ -3,6 +3,7 @@ import pytz
 from sqlalchemy import text
 from datetime import datetime
 from ssh_db_connector import SSHDatabaseConnector
+import time
 
 LA_TZ = pytz.timezone("America/Los_Angeles")
 
@@ -17,8 +18,6 @@ class QueryManager:
         self.logger = logger or (lambda msg: print(msg))
         self.units = units.lower()
         self.root = root
-        # (earliest_local_naive_datetime, latest_local_naive_datetime)
-        self.timestamp_range = (None, None)
 
     def warm_up(self):
         """
@@ -27,7 +26,7 @@ class QueryManager:
         if not self.connect():
             return
 
-        import time
+
         st = time.time()
         try:
             with self.engine.connect() as conn:
@@ -55,7 +54,7 @@ class QueryManager:
     # -------------------------------
     # Main query
     # -------------------------------
-    def run_query(self, filter_type, filter_value, start_date_str, end_date_str, selected_columns):
+    def run_query(self, filter_type, filter_value, start_date_str, end_date_str):
         self.connect()
         if not self.engine:
             return pd.DataFrame()
@@ -72,32 +71,6 @@ class QueryManager:
             "start_date": start_la.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S"),
             "end_date": end_la.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S"),
         }
-
-        # --- Earliest/latest (set once) ---
-        if filter_type == "esp_ble_id":
-            range_query = text("""
-                               SELECT MIN(m.updated_at) AS earliest, MAX(m.updated_at) AS latest
-                               FROM cp_device_metrics m
-                                        JOIN (SELECT DISTINCT device_name
-                                              FROM cparchivedb.cp_device
-                                              WHERE esp_ble_id = :filter_value) d ON m.device_name = d.device_name
-                               """)
-        else:
-            range_query = text(f"""
-                SELECT MIN(updated_at) AS earliest, MAX(updated_at) AS latest
-                FROM cp_device_metrics
-                WHERE {filter_type} = :filter_value
-            """)
-
-        with self.engine.connect() as conn:
-            row = conn.execute(range_query, {"filter_value": filter_value}).first()
-
-        if row and row[0] and row[1]:
-            earliest = pd.to_datetime(row[0]).tz_localize("UTC").tz_convert(LA_TZ).tz_localize(None)
-            latest = pd.to_datetime(row[1]).tz_localize("UTC").tz_convert(LA_TZ).tz_localize(None)
-            self.timestamp_range = (earliest, latest)
-        else:
-            self.timestamp_range = (None, None)
 
         # --- Check inside requested window ---
         if filter_type == "esp_ble_id":
@@ -124,7 +97,6 @@ class QueryManager:
             has_data = conn.execute(check_query, params).scalar()
 
         if not has_data:
-            before, after = None, None
             with self.engine.connect() as conn:
                 # before window
                 q_before = text("""
@@ -160,9 +132,6 @@ class QueryManager:
                     after = (pd.to_datetime(row)
                              .tz_localize("UTC").tz_convert(LA_TZ).tz_localize(None))
 
-            raise NoDataInWindow(self.timestamp_range[0], self.timestamp_range[1],
-                                 before=before, after=after)
-
         if filter_type == "esp_ble_id":
             query = text(f"""
                 WITH device AS (
@@ -194,6 +163,10 @@ class QueryManager:
         # --- Normalize ---
         if df.empty:
             self.logger("No metrics: query returned 0 rows (unexpected).")
+            raise NoDataFound(
+                f"No data found for {filter_type}={filter_value} "
+                f"between {start_date_str} and {end_date_str}"
+            )
             return pd.DataFrame()
 
         df.columns = [c.lower() for c in df.columns]
@@ -240,14 +213,52 @@ class QueryManager:
             if temp_cols:
                 df.drop(columns=temp_cols, inplace=True)
 
-        return df if df is not None else pd.DataFrame()
+        return df
 
-    # -------------------------------
-    # Optional: expose a getter
-    # -------------------------------
-    def get_timestamp_range(self):
-        """Return (earliest_local_naive, latest_local_naive) or (None, None)."""
-        return self.timestamp_range
+    def get_date_ranges(self, filter_type, filter_value):
+        if not self.connect():
+            return []
+
+        if not filter_value:
+            return []
+
+        if filter_type == "esp_ble_id":
+            sql = text("""
+                       SELECT DISTINCT DATE (m.updated_at) AS day
+                       FROM cp_device_metrics m
+                           JOIN cparchivedb.cp_device d
+                       ON m.device_name = d.device_name
+                       WHERE d.esp_ble_id = :filter_value
+                       ORDER BY day
+                       """)
+        else:
+            sql = text(f"""
+                SELECT DISTINCT DATE(updated_at) AS day
+                FROM cp_device_metrics
+                WHERE {filter_type} = :filter_value
+                ORDER BY day
+            """)
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(sql, {"filter_value": filter_value}).fetchall()
+
+        if not rows:
+            return []
+
+        days = pd.Series(pd.to_datetime([r[0] for r in rows])).sort_values().reset_index(drop=True)
+
+        # Build contiguous ranges
+        ranges = []
+        start = end = days.iloc[0]
+        for d in days.iloc[1:]:
+            if (d - end).days == 1:
+                end = d
+            else:
+                ranges.append((start, end))
+                start = end = d
+        ranges.append((start, end))
+
+        return ranges
 
     # -------------------------------
     # Close connections
@@ -265,24 +276,7 @@ class QueryManager:
             except Exception:
                 pass
 
-class NoDataInWindow(Exception):
-    def __init__(self, earliest=None, latest=None, before=None, after=None):
-        if earliest is None or latest is None:
-            msg = "No data exists for this user/device at all.\nPossible user mismatch with filter type/value."
-        else:
-            msg = (f"No data in requested window.\n"
-                   f"Data detected in ranges outside your provided range.\n"
-                   f"{earliest:%Y-%m-%d} to {latest:%Y-%m-%d}")
-            if before or after:
-                parts = []
-                if before:
-                    parts.append(f"nearest before={before:%Y-%m-%d}")
-                if after:
-                    parts.append(f"nearest after={after:%Y-%m-%d}")
-                msg += "\n" + ", ".join(parts)
-        super().__init__(msg)
-        self.earliest = earliest
-        self.latest = latest
-        self.before = before
-        self.after = after
 
+class NoDataFound(Exception):
+    """Raised when no rows were found for the given filter/range."""
+    pass

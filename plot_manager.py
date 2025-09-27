@@ -111,120 +111,73 @@ class PlotManager:
     # -------------------------------
     # Plot data (fast)
     # -------------------------------
-    def plot_data(self, df, selected_columns, fresh=False, color_map=None):
+    def plot_data(self, df, selected_columns=None, fresh=False, color_map=None, col_states=None):
+        # Always trust col_states if provided
+        if col_states is not None:
+            selected_columns = [col for col, state in col_states.items() if state]
+        self.current_columns = list(selected_columns or [])
+        # This is the *only* source of truth
+        selected = set(selected_columns or [])
+        self.current_columns = list(selected)
+
         if df is None:
             return
-        # 👇 Break time gaps so lines don’t connect
-        df = self._break_time_gaps(df, threshold="1D")  # threshold = 1 day (tune this)
+
+        # Break time gaps
+        df = self._break_time_gaps(df, threshold="1D")
 
         # Ensure plot exists
         if self.fig is None or self.ax is None or self.canvas is None:
             self.init_plot()
 
-        # --- Prep dataframe once on fresh datasets ---
         if fresh:
-            # Reset state
             self.lines.clear()
             self.vline = None
             self._tooltip = None
-            self.ax.clear()  # full wipe only on fresh/new data
+            self.ax.clear()
+            self.current_df = pd.DataFrame()
 
-            # Ensure datetime column & tz-naive
-            if "updated_at" not in df.columns:
-                self.ax.text(
-                    0.5, 0.5, "No results",
-                    ha="center", va="center", transform=self.ax.transAxes,
-                    fontsize=14, color="red"
-                )
+            # Handle empty selection immediately
+            if not selected:
+                self._draw_fixed_legend()
                 self.canvas.draw_idle()
-                self.current_df = pd.DataFrame()  # reset state
                 return
 
-            # Only parse if not already datetime64[ns]
+            # Normal datetime prep
+            if "updated_at" not in df.columns:
+                self.ax.text(0.5, 0.5, "No results",
+                             ha="center", va="center", transform=self.ax.transAxes,
+                             fontsize=14, color="red")
+                self.canvas.draw_idle()
+                return
+
+            df = df.copy()
             if not pd.api.types.is_datetime64_any_dtype(df["updated_at"]):
-                df = df.copy()
                 df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
 
-            # Drop bad rows and sort by time for fast searchsorted
             df = df.dropna(subset=["updated_at"]).sort_values("updated_at")
-
             self.current_df = df
             self._x_pd = df["updated_at"]
-
-            # If timezone-aware, make naive
-            if getattr(self._x_pd.dt, "tz", None) is not None:
-                self._x_pd = self._x_pd.dt.tz_localize(None)
-                self.current_df["updated_at"] = self._x_pd
-
-            # Sanitize: ensure datetime, drop invalids
-            self._x_pd = pd.to_datetime(self._x_pd, errors="coerce")
-            self.current_df = self.current_df.assign(updated_at=self._x_pd)
-
-            # Cache numpy version (aligned with sanitized series)
             self._x_np = self._x_pd.values.astype("datetime64[ns]")
 
-            # Precompute downsample indices (shared by all series)
-            n = len(self._x_pd)
-            if n > self.max_points:
-                step = int(np.ceil(n / self.max_points))
-                self._ds_idx = np.arange(0, n, step, dtype=int)
-            else:
-                self._ds_idx = None
+        # 🔥 Rebuild exactly what’s selected
+        # Remove all old lines first
+        for line in list(self.lines.values()):
+            line.remove()
+        self.lines.clear()
 
-            # Axes labels & ticks again after clear
-            self.ax.set_title("Device Metrics")
-            self.ax.set_xlabel("Updated at (Los Angeles)")
-            self.ax.set_ylabel("Values")
-            locator = mdates.AutoDateLocator(minticks=5, maxticks=12)
-            formatter = mdates.DateFormatter("%Y-%m-%d\n%H:%M:%S")
-            self.ax.xaxis.set_major_locator(locator)
-            self.ax.xaxis.set_major_formatter(formatter)
-            self.fig.autofmt_xdate(rotation=0, ha="center")
-
-            # Home limits
-            if len(self._x_pd) > 0:
-                self.ax.set_xlim(self._x_pd.iloc[0], self._x_pd.iloc[-1])
-                self.home_xlim = self.ax.get_xlim()
-
-        # Keep track of selection
-        self.current_columns = list(selected_columns or [])
-
-        # --- Create or toggle lines without clearing ---
-        # Build or ensure numeric columns exist
-        df = self.current_df
-        if df.empty:
-            self.ax.text(
-                0.5, 0.5, "No results",
-                ha="center", va="center", transform=self.ax.transAxes,
-                fontsize=14, color="red"
-            )
+        if not selected:
+            self._draw_fixed_legend()
             self.canvas.draw_idle()
             return
 
-        # Precompute x to plot (downsampled or full)
-        if self._ds_idx is not None:
-            x_plot = self._x_pd.iloc[self._ds_idx]
-        else:
-            x_plot = self._x_pd
-
-        # Show/hide columns by toggling visibility or creating missing lines
-        selected = set(self.current_columns)
-        existing = set(self.lines.keys())
-
-        # Create lines for new selections
-        for col in selected - existing:
-            if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-                series = pd.to_numeric(df[col], errors="coerce")
+        # Add back only checked columns
+        for col in selected:
+            if col in self.current_df.columns and pd.api.types.is_numeric_dtype(self.current_df[col]):
+                series = pd.to_numeric(self.current_df[col], errors="coerce")
                 sub = pd.DataFrame({"updated_at": self._x_pd, col: series})
-
-                if sub.empty:
-                    continue
-
-                # Apply downsampling consistently
-                if len(sub) > self.max_points:
-                    step = int(np.ceil(len(sub) / self.max_points))
-                    sub = sub.iloc[::step]
-
+                if self._ds_idx is not None:
+                    sub = sub.iloc[self._ds_idx]
                 line, = self.ax.plot(
                     sub["updated_at"], sub[col],
                     label=col,
@@ -233,19 +186,78 @@ class PlotManager:
                 self.lines[col] = line
                 self.line_colors[col] = line.get_color()
 
-        # Toggle visibility for all lines
-        for col, line in self.lines.items():
-            line.set_visible(col in selected)
-
-        # Only autoscale when loading fresh data (not on every toggle)
-        if fresh:
-            self.ax.relim(visible_only=True)
-            self.ax.autoscale(axis="y", tight=False)
-
-        # Rebuild legend from visible lines only
+        # Update legend
         self._draw_fixed_legend()
-
         self.canvas.draw_idle()
+
+    def _save_cache(self, df, selected_columns, col_states=None):
+        try:
+            cols = list(df.columns)
+            if "updated_at" not in cols:
+                cols.append("updated_at")
+
+            if "updated_at" in df.columns and not df.empty:
+                earliest = pd.to_datetime(df["updated_at"]).min()
+                latest = pd.to_datetime(df["updated_at"]).max()
+                earliest_iso = earliest.isoformat()
+                latest_iso = latest.isoformat()
+            else:
+                earliest_iso = latest_iso = None
+
+            try:
+                df[cols].to_parquet(self.cache_file, index=False)
+                fmt = "parquet"
+            except (ImportError, ValueError):
+                alt_file = os.path.splitext(self.cache_file)[0] + ".csv"
+                df[cols].to_csv(alt_file, index=False)
+                self.cache_file = alt_file
+                fmt = "csv"
+
+            xlim = list(self.ax.get_xlim()) if self.ax else None
+            ylim = list(self.ax.get_ylim()) if self.ax else None
+
+            meta = {
+                "col_states": {
+                    col: (col in self.current_columns)
+                    for col in (col_states or {}).keys()
+                    if col != "updated_at"
+                },
+                "xlim": xlim,
+                "ylim": ylim,
+                "version": 1,
+                "format": fmt,
+                "time_range": {"earliest": earliest_iso, "latest": latest_iso},
+            }
+
+            with open(self.meta_file, "w") as f:
+                json.dump(meta, f)
+
+            return True
+        except Exception as e:
+            print(f"[Cache] Failed to save: {e}")
+            return False
+
+    def load_cache(self):
+        if os.path.exists(self.cache_file) and os.path.exists(self.meta_file):
+            try:
+                df = pd.read_parquet(self.cache_file)
+                with open(self.meta_file, "r") as f:
+                    meta = json.load(f)
+
+                col_states = {c: s for c, s in meta.get("col_states", {}).items() if c != "updated_at"}
+
+                self.plot_data(df, fresh=True, col_states=col_states)
+
+                if meta.get("xlim"):
+                    self.ax.set_xlim(meta["xlim"])
+                if meta.get("ylim"):
+                    self.ax.set_ylim(meta["ylim"])
+
+                self.canvas.draw_idle()
+                return df, list(col_states.keys()), col_states, meta.get("time_range")
+            except Exception as e:
+                print(f"[Cache] Failed to load: {e}")
+        return None, [], {}, {}
 
     # -------------------------------
     # Tooltip + Crosshair (fast nearest)
@@ -587,75 +599,6 @@ class PlotManager:
 
         return df
 
-    def _save_cache(self, df, selected_columns, col_states=None):
-        try:
-            cols = list(df.columns)
-            if "updated_at" not in cols:
-                cols.append("updated_at")
-
-            # compute time_range for meta
-            if "updated_at" in df.columns and not df.empty:
-                earliest = pd.to_datetime(df["updated_at"]).min()
-                latest = pd.to_datetime(df["updated_at"]).max()
-                # serialize as ISO for stable signatures
-                earliest_iso = earliest.isoformat()
-                latest_iso = latest.isoformat()
-            else:
-                earliest_iso = latest_iso = None
-
-            try:
-                df[cols].to_parquet(self.cache_file, index=False)
-                fmt = "parquet"
-            except (ImportError, ValueError) as e:
-                import os
-                alt_file = os.path.splitext(self.cache_file)[0] + ".csv"
-                df[cols].to_csv(alt_file, index=False)
-                self.cache_file = alt_file
-                fmt = "csv"
-                print(f"[Cache] Falling back to CSV: {e}")
-
-            # safe x/y lim capture
-            xlim = list(self.ax.get_xlim()) if self.ax else None
-            ylim = list(self.ax.get_ylim()) if self.ax else None
-
-            meta = {
-                "columns": selected_columns or [],
-                "col_states": col_states or {},
-                "xlim": xlim,
-                "ylim": ylim,
-                "version": 1,
-                "format": fmt,
-                "time_range": {"earliest": earliest_iso, "latest": latest_iso},
-            }
-            with open(self.meta_file, "w") as f:
-                json.dump(meta, f)
-
-            return True
-        except Exception as e:
-            print(f"[Cache] Failed to save: {e}")
-            return False
-
-    def load_cache(self):
-        if os.path.exists(self.cache_file) and os.path.exists(self.meta_file):
-            try:
-                df = pd.read_parquet(self.cache_file)
-                with open(self.meta_file, "r") as f:
-                    meta = json.load(f)
-                columns = meta.get("columns", [])
-                col_states = meta.get("col_states", {})
-                xlim, ylim = meta.get("xlim"), meta.get("ylim")
-
-                # Fresh because df changed
-                self.plot_data(df, columns, fresh=True)
-                if xlim: self.ax.set_xlim(xlim)
-                if ylim: self.ax.set_ylim(ylim)
-                self.canvas.draw_idle()
-                df = pd.read_parquet(self.cache_file) if self.cache_file.endswith(".parquet") else pd.read_csv(
-                    self.cache_file)
-                return df, meta.get("columns", []), meta.get("col_states", {}), meta.get("time_range")
-            except Exception as e:
-                print(f"[Cache] Failed to load: {e}")
-        return None, [], {}
 
     def load_col_states(self):
         """Return only the cached checkbox states from meta file."""
