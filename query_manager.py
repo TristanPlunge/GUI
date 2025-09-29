@@ -19,25 +19,6 @@ class QueryManager:
         self.units = units.lower()
         self.root = root
 
-    def warm_up(self):
-        """
-        Run cheap queries to warm MySQL's buffer pool and engine.
-        """
-        if not self.connect():
-            return
-
-
-        st = time.time()
-        try:
-            with self.engine.connect() as conn:
-                self.logger("Warm-up queries executed.")
-                # force scan of earliest and latest index entries
-                conn.execute(text("SELECT 1 from cp_device_metrics m JOIN (SELECT device_name FROM cp_device LIMIT 1) d ON m.device_name = d.device_name LIMIT 1;"))
-
-        except Exception as e:
-            self.logger(f"Warm-up failed: {e}")
-        print(f"Warm-up query execution time: {time.time() - st:.3f} sec.")
-
     # -------------------------------
     # Connection handling
     # -------------------------------

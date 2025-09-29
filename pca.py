@@ -1,4 +1,3 @@
-# cycle_gui.py
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import pandas as pd
@@ -6,10 +5,14 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # === CONFIG ===
-COMPRESSOR_THRESHOLD = 1.0   # amps
+COMPRESSOR_THRESHOLD = 1.0   # amps (used to detect ON/OFF state)
 MAX_EXPECTED_DURATION = 30   # minutes
 MIN_EXPECTED_DURATION = 5    # minutes
 MIN_COOLING_RATE = 0.2       # °F per minute
+
+# Compressor current expectations (raw dataset values)
+MIN_COMPRESSOR_AMP = 2.3     # amps (too low if below this)
+MAX_COMPRESSOR_AMP = 4.0     # amps (too high if above this)
 
 COLUMNS = [
     "updated_at",
@@ -152,10 +155,21 @@ class CycleAnalyzerGUI:
             if end_temp > target_temp + 1:
                 anomaly_reasons.append("target not reached")
 
+            # New: Check compressor amps
+            avg_current = df.loc[s:e, "compressor_current_amp"].mean()
+            if avg_current < MIN_COMPRESSOR_AMP:
+                anomaly_reasons.append("compressor current too low")
+            elif avg_current > MAX_COMPRESSOR_AMP:
+                anomaly_reasons.append("compressor current too high")
+
             color = "green" if not anomaly_reasons else "red"
             ax.axvspan(start_time, end_time, color=color, alpha=0.2)
 
-            summary = f"Cycle {start_time:%m-%d %H:%M} → {end_time:%m-%d %H:%M} | {duration_min:.1f} min, rate={cooling_rate:.2f} °F/min"
+            summary = (
+                f"Cycle {start_time:%m-%d %H:%M} → {end_time:%m-%d %H:%M} | "
+                f"{duration_min:.1f} min, rate={cooling_rate:.2f} °F/min, "
+                f"avg_current={avg_current:.2f} A"
+            )
             if anomaly_reasons:
                 summary += " ⚠️ " + ", ".join(anomaly_reasons)
             else:

@@ -244,10 +244,26 @@ class PlotManager:
                 with open(self.meta_file, "r") as f:
                     meta = json.load(f)
 
-                col_states = {c: s for c, s in meta.get("col_states", {}).items() if c != "updated_at"}
+                # --- Handle col_states flexibly (dict or list) ---
+                col_states_meta = meta.get("col_states", {})
+                if isinstance(col_states_meta, list):
+                    # stored as list of enabled columns
+                    col_states = {c: True for c in col_states_meta}
+                elif isinstance(col_states_meta, dict):
+                    col_states = {c: s for c, s in col_states_meta.items() if c != "updated_at"}
+                else:
+                    col_states = {}
 
-                self.plot_data(df, fresh=True, col_states=col_states)
+                # --- Select only checked columns for plotting ---
+                checked_cols = [c for c, s in col_states.items() if s]
+                if checked_cols:
+                    df_to_plot = df[["updated_at"] + [c for c in checked_cols if c in df.columns]]
+                else:
+                    df_to_plot = df[["updated_at"]]  # only x-axis if nothing is checked
 
+                # ✅ only plot checked columns
+                self.plot_data(df_to_plot, fresh=True, col_states=col_states)
+                # Restore axis limits if they exist
                 if meta.get("xlim"):
                     self.ax.set_xlim(meta["xlim"])
                 if meta.get("ylim"):
@@ -255,8 +271,10 @@ class PlotManager:
 
                 self.canvas.draw_idle()
                 return df, list(col_states.keys()), col_states, meta.get("time_range")
+
             except Exception as e:
                 print(f"[Cache] Failed to load: {e}")
+
         return None, [], {}, {}
 
     # -------------------------------

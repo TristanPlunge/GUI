@@ -144,10 +144,6 @@ class MetricsApp:
         # Show window
         self.root.after(50, self.root.deiconify)
         self.query_manager = QueryManager(logger=self.log, root=self.root)
-        # Run warm-up in the background so UI doesn’t block
-        self.root.after(1000, lambda: threading.Thread(
-            target=self.query_manager.warm_up, daemon=True
-        ).start())
 
     def save_to_csv(self):
         if self.df is None or self.df.empty:
@@ -650,6 +646,7 @@ class MetricsApp:
 
                 output = ", ".join(formatted)
                 self.current_time_range = output
+                self.current_user_id = self.filter_value.get()
                 # ✅ Update both log and status label
                 self.safe_after(0, self.log, f"📅 Data ranges: {output}")
                 self.safe_after(0, self.update_status_text)
@@ -689,7 +686,6 @@ class MetricsApp:
 
             self.df = df
             self.build_column_checkboxes(df.columns, getattr(self, "_saved_col_states", None))
-
 
             if self.enable_table:
                 self.show_table(df, col_states)
@@ -1552,7 +1548,7 @@ class MetricsApp:
 
     def update_status_text(self):
         self.status_label.configure(
-            text=f"User: {self.current_user_id} | Data Time Range: {self.current_time_range}"
+            text=f"User ID: {self.current_user_id} | Data Time Range: {self.current_time_range}"
         )
 
     def on_column_change(self):
