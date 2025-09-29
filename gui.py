@@ -504,7 +504,6 @@ class MetricsApp:
 
     def _save_config_now(self):
         try:
-            # Always normalize entries to YYYY-MM-DD before saving
             start_str = self.start_date_entry.get().strip()
             end_str = self.end_date_entry.get().strip()
             if start_str:
@@ -516,13 +515,20 @@ class MetricsApp:
             cfg = {
                 "filter_type": self.filter_type.get(),
                 "filter_value": self.filter_value.get(),
-                "search_mode": self.config.get("search_mode", "full_name"),
                 "start_date": start_str,
                 "end_date": end_str,
                 "columns": self.get_selected_table_columns(),
                 "col_states": {col: var.get() for col, var in self.col_vars.items()},
                 "window_state": state,
             }
+
+            # --- add plot state ---
+            if self.plot_manager and self.plot_manager.ax:
+                cfg["plot_state"] = {
+                    "xlim": list(self.plot_manager.ax.get_xlim()),
+                    "ylim": list(self.plot_manager.ax.get_ylim()),
+                }
+
             if state == "normal":
                 cfg["window_size"] = self.root.geometry()
             cfg["collapsible_states"] = {
@@ -530,9 +536,8 @@ class MetricsApp:
                 "table": self.table_section.get_state(),
                 "log": getattr(self, "log_section", None).get_state() if hasattr(self, "log_section") else "expanded",
             }
-            config_manager.save_config(cfg)
 
-            # keep in memory so next build_column_checkboxes uses it
+            config_manager.save_config(cfg)
             self._saved_col_states = cfg["col_states"]
 
         except Exception as e:
@@ -663,55 +668,36 @@ class MetricsApp:
 
     def on_load_cache(self):
         try:
-            new_sig = self._cache_signature()  # read from meta on disk if possible
-            if new_sig and new_sig == self._last_cache_signature:
-                self.log("ℹ️ Cache already loaded, reusing existing data.")
-                if self.df is not None and not self.df.empty:
-                    if self.enable_table:
-                        self.show_table(self.df, self._saved_col_states)
-                    if self.enable_plot:
-                        self.plot_manager.plot_data(
-                            self.df,
-                            self.get_selected_metrics(),
-                            fresh=False,
-                            color_map=self.color_map,
-                        )
-                    self._update_status_labels(self.df)
-                return
-
-            df, columns, col_states, time_range = self.plot_manager.load_cache()
+            # Load just the parquet data (PlotManager no longer handles meta.json)
+            df = self.plot_manager.load_cache()
             if df is None or df.empty:
                 self.log("No cached data found.")
                 return
 
             self.df = df
+
+            # Rebuild checkboxes using saved states from config.json
             self.build_column_checkboxes(df.columns, getattr(self, "_saved_col_states", None))
 
             if self.enable_table:
-                self.show_table(df, col_states)
+                self.show_table(df, self._saved_col_states)
 
             if self.enable_plot:
-                sel = [c for c in columns if c in self.color_map] or None
+                sel = [c for c, checked in self._saved_col_states.items() if checked and c in self.color_map]
                 self.plot_manager.plot_data(df, sel, fresh=True, color_map=self.color_map)
 
-            # 🔧 Normalize cached time_range (parse back into datetime objects)
-            tr = None
-            if time_range:
-                try:
-                    from dateutil import parser
-                    tr = {
-                        "earliest": parser.parse(time_range["earliest"]),
-                        "latest": parser.parse(time_range["latest"]),
-                    }
-                except Exception:
-                    tr = time_range  # keep raw if parsing fails
+                # Restore saved plot_state (xlim, ylim) from config.json if available
+                plot_state = self.config.get("plot_state", {})
+                if "xlim" in plot_state:
+                    self.plot_manager.ax.set_xlim(plot_state["xlim"])
+                if "ylim" in plot_state:
+                    self.plot_manager.ax.set_ylim(plot_state["ylim"])
+                self.plot_manager.canvas.draw_idle()
 
-            self._update_status_labels(df, tr)
+            # Update labels (we no longer have time_range in meta, but we can recompute)
+            self._update_status_labels(df)
 
-            # Update last loaded signature
-            self._last_cache_signature = self._cache_signature()
-
-            # ⛔ Disable button until a new cache is saved
+            # Disable until a new cache is saved
             self.cache_btn.configure(state="disabled")
 
             self.log(f"Loaded {len(df)} cached rows into table and plot.")
@@ -1518,7 +1504,8 @@ class MetricsApp:
         col_states = {col: (self.col_vars[col].get() if col in self.col_vars else True)
                       for col in df.columns}
 
-        ok = self.plot_manager._save_cache(df, list(df.columns), col_states)
+        ok = self.plot_manager._save_cache(df, col_states)
+
         if ok:
             self._last_cache_signature = self._cache_signature(df)
             self.log(f"💾 Cache saved with {sum(col_states.values())} selected columns")

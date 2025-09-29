@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
-import matplotlib
+import customtkinter as ctk
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import RectangleSelector
 from datetime import timedelta, datetime
 import json, os
@@ -65,12 +65,26 @@ class PlotManager:
     # -------------------------------
     # Init plot
     # -------------------------------
-    def init_plot(self):
-        self.fig, self.ax = plt.subplots()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.output_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-        # Rectangle selector for zoom
+    def init_plot(self):
+        # Container frame for plot + toolbar
+        self.plot_container = ctk.CTkFrame(self.output_frame)
+        self.plot_container.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Create figure + canvas
+        self.fig, self.ax = plt.subplots()
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
+
+        # Toolbar (must be created AFTER canvas, and explicitly packed)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_container)
+        self.toolbar.update()
+        self.toolbar.pack(side="bottom", fill="x")  # explicit pack, don't rely on default
+
+        # Canvas widget
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        # Rectangle selector
         self.selector = RectangleSelector(
             self.ax, self._on_select,
             useblit=True, interactive=False,
@@ -86,24 +100,17 @@ class PlotManager:
         self.fig.canvas.mpl_connect("axes_enter_event", self._on_axes_enter)
         self.fig.canvas.mpl_connect("figure_leave_event", self._on_figure_leave)
 
+        # Labels & formatting
+        self.ax.set_title("Device Metrics")
+        self.ax.set_xlabel("Updated at (Los Angeles)")
+        self.ax.set_ylabel("Values")
+        self.ax.margins(x=0)
 
-        # Minor perf tweaks
-        try:
-            self.ax.set_title("Device Metrics")
-            self.ax.set_xlabel("Updated at (Los Angeles)")
-            self.ax.set_ylabel("Values")
-            self.ax.margins(x=0)
-        except Exception:
-            pass
-
-        # Date formatting
         locator = mdates.AutoDateLocator(minticks=5, maxticks=12)
         formatter = mdates.DateFormatter("%m/%d")
-
         self.ax.xaxis.set_major_locator(locator)
         self.ax.xaxis.set_major_formatter(formatter)
         self.fig.autofmt_xdate(rotation=0, ha="center")
-
     def _on_axes_enter(self, event):
         # restore normal tooltip mode
         self._tooltip_mode = "cursor"
@@ -190,7 +197,7 @@ class PlotManager:
         self._draw_fixed_legend()
         self.canvas.draw_idle()
 
-    def _save_cache(self, df, selected_columns, col_states=None):
+    def _save_cache(self, df, col_states=None):
         try:
             cols = list(df.columns)
             if "updated_at" not in cols:
@@ -204,6 +211,7 @@ class PlotManager:
             else:
                 earliest_iso = latest_iso = None
 
+            # Always write parquet (or fallback to CSV)
             try:
                 df[cols].to_parquet(self.cache_file, index=False)
                 fmt = "parquet"
@@ -213,24 +221,19 @@ class PlotManager:
                 self.cache_file = alt_file
                 fmt = "csv"
 
-            xlim = list(self.ax.get_xlim()) if self.ax else None
-            ylim = list(self.ax.get_ylim()) if self.ax else None
-
-            meta = {
-                "col_states": {
-                    col: (col in self.current_columns)
-                    for col in (col_states or {}).keys()
-                    if col != "updated_at"
-                },
-                "xlim": xlim,
-                "ylim": ylim,
-                "version": 1,
-                "format": fmt,
+            # Save plot + column state into config.json
+            plot_state = {
+                "col_states": col_states or {},
+                "xlim": list(self.ax.get_xlim()) if self.ax else None,
+                "ylim": list(self.ax.get_ylim()) if self.ax else None,
                 "time_range": {"earliest": earliest_iso, "latest": latest_iso},
+                "format": fmt,
             }
 
-            with open(self.meta_file, "w") as f:
-                json.dump(meta, f)
+            import config_manager
+            cfg = config_manager.load_config()
+            cfg["plot_state"] = plot_state
+            config_manager.save_config(cfg)
 
             return True
         except Exception as e:
@@ -238,44 +241,13 @@ class PlotManager:
             return False
 
     def load_cache(self):
-        if os.path.exists(self.cache_file) and os.path.exists(self.meta_file):
+        if os.path.exists(self.cache_file):
             try:
                 df = pd.read_parquet(self.cache_file)
-                with open(self.meta_file, "r") as f:
-                    meta = json.load(f)
-
-                # --- Handle col_states flexibly (dict or list) ---
-                col_states_meta = meta.get("col_states", {})
-                if isinstance(col_states_meta, list):
-                    # stored as list of enabled columns
-                    col_states = {c: True for c in col_states_meta}
-                elif isinstance(col_states_meta, dict):
-                    col_states = {c: s for c, s in col_states_meta.items() if c != "updated_at"}
-                else:
-                    col_states = {}
-
-                # --- Select only checked columns for plotting ---
-                checked_cols = [c for c, s in col_states.items() if s]
-                if checked_cols:
-                    df_to_plot = df[["updated_at"] + [c for c in checked_cols if c in df.columns]]
-                else:
-                    df_to_plot = df[["updated_at"]]  # only x-axis if nothing is checked
-
-                # ✅ only plot checked columns
-                self.plot_data(df_to_plot, fresh=True, col_states=col_states)
-                # Restore axis limits if they exist
-                if meta.get("xlim"):
-                    self.ax.set_xlim(meta["xlim"])
-                if meta.get("ylim"):
-                    self.ax.set_ylim(meta["ylim"])
-
-                self.canvas.draw_idle()
-                return df, list(col_states.keys()), col_states, meta.get("time_range")
-
+                return df
             except Exception as e:
                 print(f"[Cache] Failed to load: {e}")
-
-        return None, [], {}, {}
+        return None
 
     # -------------------------------
     # Tooltip + Crosshair (fast nearest)
@@ -355,7 +327,7 @@ class PlotManager:
         bg = self.ax.annotate(
             "\n".join(lines),
             xy=(event.xdata, event.ydata),
-            xytext=(10, 10),
+            xytext=(30, 10),
             textcoords="offset points",
             fontsize=9,
             color="none",
@@ -372,7 +344,7 @@ class PlotManager:
             t = self.ax.annotate(
                 text,
                 xy=(event.xdata, event.ydata),
-                xytext=(14, y_offset_start - i * line_height),
+                xytext=(34, y_offset_start - i * line_height),
                 textcoords="offset points",
                 fontsize=9,
                 color=c,
